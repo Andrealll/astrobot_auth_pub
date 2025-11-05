@@ -2,4 +2,4 @@ fastapi
 uvicorn
 pyjwt
 cryptography
-
+python-multipart
