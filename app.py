@@ -2,12 +2,13 @@ from fastapi import FastAPI, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
 from cryptography.fernet import Fernet
-import jwt, os
+import jwt, os, hashlib
+from typing import Dict
 
 # ===============================
 # 🚀 APP CONFIG
 # ===============================
-app = FastAPI(title="AstroBot Auth Pub", version="1.0")
+app = FastAPI(title="AstroBot Auth Pub", version="1.1")
 
 # 🔓 CORS: permette a tutti i frontend di chiamare il servizio
 app.add_middleware(
@@ -36,6 +37,82 @@ PRIVATE_KEY = load_private_key()
 ISSUER = os.getenv("AUTH_ISSUER", "astrobot-auth-pub")
 AUDIENCE = os.getenv("AUTH_AUDIENCE", "chatbot-test")
 
+# Salt per hashing password (per ambiente dev/prod puoi metterlo in env)
+AUTH_PASSWORD_SALT = os.getenv("AUTH_PASSWORD_SALT", "change-me-dev-salt")
+
+def hash_password(raw: str) -> str:
+    data = (AUTH_PASSWORD_SALT + raw).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+# ===============================
+# 👤 UTENTI DEMO (preconfigurati)
+# ===============================
+DEMO_USERS = {
+    # utente storico, resta compatibile
+    "demo": {
+        "password": "demo",
+        "role": "free",
+    },
+    # utente free esplicito
+    "demo_free": {
+        "password": "demo",
+        "role": "free",
+    },
+    # utente premium con crediti pagati (per test)
+    "demo_premium": {
+        "password": "demo",
+        "role": "premium",
+    },
+}
+
+# ===============================
+# 👤 UTENTI REGISTRATI (IN-MEMORY)
+# ===============================
+# In produzione qui metterai un DB; per ora è in-memory.
+REGISTERED_USERS: Dict[str, Dict[str, str]] = {}
+
+
+def create_access_token_response(sub: str, role: str) -> dict:
+    """
+    Crea il payload JWT e restituisce la response standard token_type/expires_in.
+    """
+    payload = {
+        "sub": sub,
+        "role": role,
+        "iss": ISSUER,
+        "aud": AUDIENCE,
+        "iat": datetime.utcnow(),
+        "exp": datetime.utcnow() + timedelta(hours=1),
+    }
+    token = jwt.encode(payload, PRIVATE_KEY, algorithm="RS256", headers={"kid": "k1"})
+    return {
+        "access_token": token,
+        "token_type": "Bearer",
+        "expires_in": 3600,
+    }
+
+
+def authenticate_user(username: str, password: str) -> str:
+    """
+    Ritorna il ruolo ("free" / "premium") se username/password sono validi.
+    Controlla prima gli utenti DEMO, poi quelli REGISTRATI.
+    """
+    # 1) demo users (password in chiaro: solo per test)
+    demo_cfg = DEMO_USERS.get(username)
+    if demo_cfg and demo_cfg["password"] == password:
+        return demo_cfg["role"]
+
+    # 2) utenti registrati (password hashata)
+    reg_cfg = REGISTERED_USERS.get(username)
+    if reg_cfg:
+        expected_hash = reg_cfg["password_hash"]
+        if expected_hash == hash_password(password):
+            return reg_cfg["role"]
+
+    # nessun match
+    raise HTTPException(status_code=401, detail="Invalid credentials")
+
+
 # ===============================
 # 🏠 ROUTE BASE
 # ===============================
@@ -43,29 +120,64 @@ AUDIENCE = os.getenv("AUTH_AUDIENCE", "chatbot-test")
 def root():
     return {"status": "ok", "message": "AstroBot Auth Pub online 🚀"}
 
+
+# ===============================
+# 🆕 REGISTRAZIONE UTENTE
+# ===============================
+@app.post("/register")
+async def register(
+    username: str = Form(...),
+    password: str = Form(...),
+    role: str = Form("free"),
+):
+    """
+    Crea un nuovo utente e restituisce subito un JWT valido.
+
+    - username: stringa unica (es. email), case sensitive per semplicità
+    - password: testo in chiaro (viene hashata lato server)
+    - role: "free" o "premium" (default "free")
+    """
+    username = username.strip()
+    role = role.strip().lower()
+
+    if not username:
+        raise HTTPException(status_code=400, detail="Username obbligatorio.")
+    if role not in ("free", "premium"):
+        raise HTTPException(status_code=400, detail="Ruolo non valido (usa free o premium).")
+
+    if username in DEMO_USERS or username in REGISTERED_USERS:
+        raise HTTPException(status_code=400, detail="Utente già esistente.")
+
+    pwd_hash = hash_password(password)
+
+    REGISTERED_USERS[username] = {
+        "password_hash": pwd_hash,
+        "role": role,
+    }
+
+    # Sub = username, role = role
+    token_resp = create_access_token_response(sub=username, role=role)
+    # puoi aggiungere info utente, utile per debug frontend
+    token_resp["user"] = {"username": username, "role": role}
+    return token_resp
+
+
 # ===============================
 # 🔐 LOGIN E GENERAZIONE TOKEN
 # ===============================
 @app.post("/login")
 async def login(username: str = Form(...), password: str = Form(...)):
-    # Demo login (da sostituire con DB in futuro)
-    if username != "demo" or password != "demo":
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    """
+    Login che supporta:
+    - utenti DEMO (demo, demo_free, demo_premium)
+    - utenti registrati via /register
 
-    # Costruisci il payload JWT
-    payload = {
-        "sub": username,
-        "role": "free",
-        "iss": ISSUER,
-        "aud": AUDIENCE,
-        "iat": datetime.utcnow(),
-        "exp": datetime.utcnow() + timedelta(hours=1)
-    }
+    Restituisce sempre un JWT con claim:
+    - sub = username
+    - role = "free" | "premium"
+    """
+    # Autenticazione (demo o registrato)
+    role = authenticate_user(username, password)
 
-    # Firma il token
-    token = jwt.encode(payload, PRIVATE_KEY, algorithm="RS256", headers={"kid": "k1"})
-    return {
-        "access_token": token,
-        "token_type": "Bearer",
-        "expires_in": 3600
-    }
+    # Risposta standard con token
+    return create_access_token_response(sub=username, role=role)
