@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from cryptography.fernet import Fernet
 import jwt, os, hashlib
 from typing import Dict
+from uuid import uuid4  # 👈 AGGIUNTO per anonymous
 
 # ===============================
 # 🚀 APP CONFIG
@@ -41,8 +42,8 @@ AUDIENCE = os.getenv("AUTH_AUDIENCE", "chatbot-test")
 AUTH_PASSWORD_SALT = os.getenv("AUTH_PASSWORD_SALT", "change-me-dev-salt")
 
 def hash_password(raw: str) -> str:
-    data = (AUTH_PASSWORD_SALT + raw).encode("utf-8")
-    return hashlib.sha256(data).hexdigest()
+  data = (AUTH_PASSWORD_SALT + raw).encode("utf-8")
+  return hashlib.sha256(data).hexdigest()
 
 # ===============================
 # 👤 UTENTI DEMO (preconfigurati)
@@ -119,6 +120,22 @@ def authenticate_user(username: str, password: str) -> str:
 @app.get("/")
 def root():
     return {"status": "ok", "message": "AstroBot Auth Pub online 🚀"}
+
+
+# ===============================
+# 🆕 ROUTE ANONYMOUS (GUEST)
+# ===============================
+@app.get("/auth/anonymous")
+async def anonymous():
+    """
+    Genera un JWT per guest anonimo con:
+    - sub = "anon-<uuid>"
+    - role = "free"
+
+    Viene usato dal frontend DYANA quando l'utente non è loggato.
+    """
+    anon_id = f"anon-{uuid4()}"
+    return create_access_token_response(sub=anon_id, role="free")
 
 
 # ===============================
