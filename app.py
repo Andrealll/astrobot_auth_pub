@@ -198,3 +198,41 @@ async def login(username: str = Form(...), password: str = Form(...)):
 
     # Risposta standard con token
     return create_access_token_response(sub=username, role=role)
+
+@app.get("/auth/anonymous")
+async def anonymous_login():
+    """
+    Crea un utente anonimo con sub = "anon-<uuid>" e role="free".
+
+    Questo è quello che DYANA usa per gli ospiti senza login.
+    """
+    anon_id = f"anon-{uuid4()}"
+    return create_access_token_response(sub=anon_id, role="free")
+
+
+@app.get("/auth/demo/free")
+async def demo_free_login():
+    """
+    Utente demo con role="free".
+    Utile per test rapido da frontend.
+    """
+    return create_access_token_response(sub="demo_free", role="free")
+
+
+@app.get("/auth/demo/premium")
+async def demo_premium_login():
+    """
+    Utente demo con role="premium".
+    Utile per test crediti premium senza Stripe.
+    """
+    return create_access_token_response(sub="demo_premium", role="premium")
+
+
+@app.get("/auth/demo/user/{user_id}")
+async def demo_user_login(user_id: str):
+    """
+    Crea un token per un utente 'finto' con sub=user_id e role="free".
+
+    Utile per debug mirato (es. collegare un certo user_id a Supabase).
+    """
+    return create_access_token_response(sub=user_id, role="free")
