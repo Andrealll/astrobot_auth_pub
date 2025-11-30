@@ -3,4 +3,5 @@ uvicorn
 pyjwt
 cryptography
 python-multipart
+python-dotenv
 httpx
