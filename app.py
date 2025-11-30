@@ -5,8 +5,42 @@ from cryptography.fernet import Fernet
 import jwt, os, httpx
 from uuid import uuid4
 from dotenv import load_dotenv
+from fastapi import Depends  # se non lo hai già
+from fastapi import Body
+from pydantic import BaseModel
 
 load_dotenv()
+# ===============================
+# 🎯 CONFIG PACCHETTI CREDITI
+# ===============================
+# Unico punto di verità lato backend.
+# Il frontend leggerà questi pacchetti via /payments/packs.
+PAYMENT_PACKS = {
+    "small": {
+        "id": "small",
+        "name": "Pacchetto Small",
+        "description": "Per iniziare a provare le letture premium.",
+        "credits": 10,
+        "price_eur": 9,
+        "stripe_price_id": None,  # TODO: imposta l'ID del prezzo Stripe quando lo crei
+    },
+    "medium": {
+        "id": "medium",
+        "name": "Pacchetto Medium",
+        "description": "Per usare DYANA con continuità.",
+        "credits": 30,
+        "price_eur": 19,
+        "stripe_price_id": None,  # TODO
+    },
+    "large": {
+        "id": "large",
+        "name": "Pacchetto Large",
+        "description": "Per power user e super appassionati.",
+        "credits": 80,
+        "price_eur": 39,
+        "stripe_price_id": None,  # TODO
+    },
+}
 
 # ======================================================
 # 🚀 APP CONFIG
@@ -146,3 +180,58 @@ async def demo_premium_login():
     if not DEMO_PREMIUM_USER_ID:
         raise HTTPException(status_code=500, detail="DEMO_PREMIUM_USER_ID missing in env")
     return create_access_token_response(sub=DEMO_PREMIUM_USER_ID, role="premium")
+
+
+# ===============================
+# 💳 PAGAMENTI – LISTA PACCHETTI
+# ===============================
+@app.get("/payments/packs")
+async def list_payment_packs():
+    """
+    Restituisce i pacchetti crediti disponibili.
+    Usato dal frontend DYANA per popolare la pagina /crediti.
+    """
+    return {"packs": list(PAYMENT_PACKS.values())}
+
+
+
+# ===============================
+# 💳 PAGAMENTI – CREAZIONE CHECKOUT (PLACEHOLDER)
+# ===============================
+class CreateCheckoutRequest(BaseModel):
+    pack_id: str
+
+
+@app.post("/payments/create-checkout-session")
+async def create_checkout_session(
+    req: CreateCheckoutRequest,
+):
+    """
+    Crea (o simula) una sessione di pagamento per un pacchetto crediti.
+
+    Per ora è un placeholder senza Stripe reale:
+    - valida il pack_id
+    - restituisce una finta checkout_url
+    Quando integrerai Stripe, qui userai la SDK ufficiale.
+    """
+    pack = PAYMENT_PACKS.get(req.pack_id)
+    if not pack:
+        raise HTTPException(status_code=400, detail="Pacchetto non valido.")
+
+    # TODO: qui in futuro:
+    # - leggere user_id dal JWT (sub)
+    # - usare stripe.checkout.Session.create(...)
+    # - impostare success_url/cancel_url
+    # - restituire data["url"]
+
+    fake_url = f"https://example.com/checkout/fake?pack_id={pack['id']}"
+
+    return {
+        "checkout_url": fake_url,
+        "pack": {
+            "id": pack["id"],
+            "credits": pack["credits"],
+            "price_eur": pack["price_eur"],
+        },
+        "mode": "placeholder",
+    }
