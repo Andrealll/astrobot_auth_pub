@@ -5,3 +5,4 @@ cryptography
 python-multipart
 python-dotenv
 httpx
+stripe
