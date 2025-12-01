@@ -265,3 +265,7 @@ async def create_checkout_session(req: CreateCheckoutRequest):
         "checkout_url": checkout_session.url,
         "session_id": checkout_session.id,
     }
+    
+from routes_credits_dashboard import router as dashboard_router
+
+app.include_router(dashboard_router)
