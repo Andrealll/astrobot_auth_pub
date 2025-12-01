@@ -56,11 +56,17 @@ PAYMENT_PACKS = {
 # ======================================================
 app = FastAPI(title="AstroBot Auth Pub", version="2.0")
 
+# ✅ ORIGINI PERMESSE
+ALLOWED_ORIGINS = [
+    "https://dyana.app",
+    "http://localhost:3000",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["*"],   # GET, POST, OPTIONS, ecc.
     allow_headers=["*"],
 )
 
