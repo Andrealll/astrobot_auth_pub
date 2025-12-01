@@ -7,9 +7,18 @@ from uuid import uuid4
 from dotenv import load_dotenv
 from fastapi import Depends  # se non lo hai già
 from fastapi import Body
+import stripe
 from pydantic import BaseModel
 
+
 load_dotenv()
+
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
+
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000")
+
 # ===============================
 # 🎯 CONFIG PACCHETTI CREDITI
 # ===============================
@@ -18,27 +27,27 @@ load_dotenv()
 PAYMENT_PACKS = {
     "small": {
         "id": "small",
-        "name": "Pacchetto Small",
+        "name": "Provami!",
         "description": "Per iniziare a provare le letture premium.",
         "credits": 10,
         "price_eur": 9,
-        "stripe_price_id": None,  # TODO: imposta l'ID del prezzo Stripe quando lo crei
+        "stripe_price_id": "price_1SZEwz69hKKhw0M9qVqJjak9",  # TODO: imposta l'ID del prezzo Stripe quando lo crei
     },
     "medium": {
         "id": "medium",
-        "name": "Pacchetto Medium",
+        "name": "AstroReader",
         "description": "Per usare DYANA con continuità.",
         "credits": 30,
         "price_eur": 19,
-        "stripe_price_id": None,  # TODO
+        "stripe_price_id": "price_1SZEy669hKKhw0M92Kw6WDKQ",  # TODO
     },
     "large": {
         "id": "large",
-        "name": "Pacchetto Large",
+        "name": "Dyaner",
         "description": "Per power user e super appassionati.",
         "credits": 80,
         "price_eur": 39,
-        "stripe_price_id": None,  # TODO
+        "stripe_price_id": "price_1SZEzM69hKKhw0M9I0wcOfpL",  # TODO
     },
 }
 
@@ -195,43 +204,64 @@ async def list_payment_packs():
 
 
 
+
 # ===============================
-# 💳 PAGAMENTI – CREAZIONE CHECKOUT (PLACEHOLDER)
+# 💳 PAGAMENTI – CREAZIONE CHECKOUT STRIPE
 # ===============================
+
 class CreateCheckoutRequest(BaseModel):
     pack_id: str
 
 
 @app.post("/payments/create-checkout-session")
-async def create_checkout_session(
-    req: CreateCheckoutRequest,
-):
+async def create_checkout_session(req: CreateCheckoutRequest):
     """
-    Crea (o simula) una sessione di pagamento per un pacchetto crediti.
+    Crea una sessione di pagamento Stripe Checkout per il pacchetto scelto.
 
-    Per ora è un placeholder senza Stripe reale:
-    - valida il pack_id
-    - restituisce una finta checkout_url
-    Quando integrerai Stripe, qui userai la SDK ufficiale.
+    - Richiede pack_id nel body.
+    - Usa PAYMENT_PACKS come unica sorgente di verità.
+    - Per ora NON collega ancora i crediti su Supabase (lo faremo via webhook).
     """
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="Stripe non configurato (manca STRIPE_SECRET_KEY).",
+        )
+
     pack = PAYMENT_PACKS.get(req.pack_id)
     if not pack:
         raise HTTPException(status_code=400, detail="Pacchetto non valido.")
 
-    # TODO: qui in futuro:
-    # - leggere user_id dal JWT (sub)
-    # - usare stripe.checkout.Session.create(...)
-    # - impostare success_url/cancel_url
-    # - restituire data["url"]
+    if not pack.get("stripe_price_id"):
+        raise HTTPException(
+            status_code=500,
+            detail="Pacchetto non configurato per Stripe (manca stripe_price_id).",
+        )
 
-    fake_url = f"https://example.com/checkout/fake?pack_id={pack['id']}"
+    try:
+        checkout_session = stripe.checkout.Session.create(
+            mode="payment",
+            line_items=[
+                {
+                    "price": pack["stripe_price_id"],
+                    "quantity": 1,
+                }
+            ],
+            # Quando il pagamento va a buon fine, Stripe rimanda l’utente qui
+            success_url=f"{FRONTEND_BASE_URL}/crediti/success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{FRONTEND_BASE_URL}/crediti/cancel",
+            metadata={
+                "pack_id": pack["id"],
+                # TODO in una fase successiva:
+                # "user_id": <sub dal JWT>, quando collegheremo i crediti
+            },
+        )
+    except stripe.error.StripeError as e:
+        # Non mostriamo troppi dettagli all’utente finale
+        msg = getattr(e, "user_message", None) or "Errore nella creazione del pagamento Stripe."
+        raise HTTPException(status_code=502, detail=msg)
 
     return {
-        "checkout_url": fake_url,
-        "pack": {
-            "id": pack["id"],
-            "credits": pack["credits"],
-            "price_eur": pack["price_eur"],
-        },
-        "mode": "placeholder",
+        "checkout_url": checkout_session.url,
+        "session_id": checkout_session.id,
     }
