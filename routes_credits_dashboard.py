@@ -1,23 +1,28 @@
 from datetime import datetime, timezone
 from typing import List, Optional
 import logging  # 👈 AGGIUNTO
+from datetime import datetime, timezone
+from typing import List, Optional
+import logging
 import os
 import httpx
 import jwt
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 
+# 👇 IMPORT UNICO DA astrobot_auth (niente fallback locale in prod)
 try:
     from astrobot_auth.credits_logic import (
         load_user_credits_state,
         get_free_credits_limits,
     )
-except ImportError:
-    # Fallback: se stai sviluppando con un credits_logic.py locale nella stessa cartella
-    from credits_logic import (
-        load_user_credits_state,
-        get_free_credits_limits,
-    )
+except ImportError as e:
+    # 🔴 Se arrivi qui su Render significa che astrobot_auth NON è installato
+    raise RuntimeError(
+        "astrobot_auth.credits_logic non è disponibile. "
+        "Assicurati di installare il package 'astrobot_auth' nel servizio astrobot_auth_pub "
+        "(es. via requirements.txt)."
+    ) from e
 
 
 logger = logging.getLogger(__name__)

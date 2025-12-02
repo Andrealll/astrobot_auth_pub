@@ -83,10 +83,18 @@ async def update_privacy(settings: dict, user: UserContext = Depends(get_current
     async with httpx.AsyncClient() as client:
         resp = await client.patch(url, headers=headers, json=patch_body)
 
-    if resp.status_code not in (200, 201):
-        raise HTTPException(status_code=500, detail=f"Supabase error: {resp.text}")
+    status = resp.status_code
+    text = resp.text or "<vuoto>"
+
+    # ✅ accettiamo 200, 201, 204 come success
+    if status not in (200, 201, 204):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Supabase error {status}: {text}",
+        )
 
     return {"status": "ok"}
+
 
 
 # -------------------------------
@@ -101,7 +109,6 @@ async def delete_user(user: UserContext = Depends(get_current_user)):
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise HTTPException(status_code=500, detail="Supabase non configurato")
 
-    # Email anonimizzata (mantiene il legame interno via user_id)
     anon_email = f"deleted_{user.sub}@dyana.app"
 
     url = f"{SUPABASE_URL}/auth/v1/admin/users/{user.sub}"
@@ -122,7 +129,16 @@ async def delete_user(user: UserContext = Depends(get_current_user)):
     async with httpx.AsyncClient() as client:
         resp = await client.patch(url, headers=headers, json=body)
 
-    if resp.status_code not in (200, 201):
-        raise HTTPException(status_code=500, detail=f"Supabase error: {resp.text}")
+    status = resp.status_code
+    text = resp.text or "<vuoto>"
+
+    # ✅ accettiamo 200, 201, 204 come success
+    if status not in (200, 201, 204):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Supabase error {status}: {text}",
+        )
 
     return {"status": "deleted", "email": anon_email}
+
+
