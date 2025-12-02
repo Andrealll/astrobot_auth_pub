@@ -1,8 +1,5 @@
 from datetime import datetime, timezone
 from typing import List, Optional
-import logging  # 👈 AGGIUNTO
-from datetime import datetime, timezone
-from typing import List, Optional
 import logging
 import os
 import httpx
@@ -10,25 +7,32 @@ import jwt
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 
-# 👇 IMPORT UNICO DA astrobot_auth (niente fallback locale in prod)
-try:
-    from astrobot_auth.credits_logic import (
-        load_user_credits_state,
-        get_free_credits_limits,
-    )
-except ImportError as e:
-    # 🔴 Se arrivi qui su Render significa che astrobot_auth NON è installato
-    raise RuntimeError(
-        "astrobot_auth.credits_logic non è disponibile. "
-        "Assicurati di installare il package 'astrobot_auth' nel servizio astrobot_auth_pub "
-        "(es. via requirements.txt)."
-    ) from e
-
-
 logger = logging.getLogger(__name__)
 
+# 👇 IMPORT UNICO DA astrobot_auth (senza fallback locale)
+from astrobot_auth.credits_logic import (
+    CreditsState,
+    load_user_credits_state,
+)
 
-    
+# Limiti free definiti SOLO per la dashboard:
+# - guest: 2 prove gratuite
+# - utente registrato: 0 free
+def get_free_credits_limits(state: CreditsState) -> tuple[int, int]:
+    """
+    Ritorna (max_free_tries, free_credits_per_try) per il tipo di utente.
+
+    Per ora:
+    - guest: 2 tentativi free
+    - registered: 0 free
+    """
+    if getattr(state, "is_guest", False):
+        # 2 tentativi free, 1 "credito free" per tentativo
+        # (in questa route usiamo solo max_free per calcolare free_left)
+        return 2, 1
+    return 0, 0
+
+
 # ===============================
 # 🔑 CONFIG / ENV
 # ===============================
@@ -64,7 +68,6 @@ PRIVATE_KEY = load_private_key_for_dashboard()
 router = APIRouter()
 
 
-
 async def fetch_user_email_and_marketing(user_id: str):
     """
     Legge email e marketing_consent da Supabase auth.admin.
@@ -87,7 +90,7 @@ async def fetch_user_email_and_marketing(user_id: str):
     user_metadata = data.get("user_metadata") or {}
     marketing = user_metadata.get("marketing_consent")
     return email, marketing
-    
+
 
 class UserContext(BaseModel):
     user_id: str
@@ -142,7 +145,6 @@ class CreditsStateResponse(BaseModel):
     total_available: int
 
 
-
 class UsageItem(BaseModel):
     id: int
     when: datetime
@@ -194,39 +196,39 @@ async def supabase_get(path: str, params: Optional[dict] = None) -> list:
     except Exception:
         return []
 
+
 # ===============================
 # HELPER
 # ===============================
-
-
 async def _fetch_user_email_from_supabase(user_id: str) -> str | None:
-  """
-  Usa l'API admin di Supabase per leggere l'email dell'utente da auth.users.
-  Ritorna None se qualcosa va storto (non rompe /credits/state).
-  """
-  if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-      return None
+    """
+    Usa l'API admin di Supabase per leggere l'email dell'utente da auth.users.
+    Ritorna None se qualcosa va storto (non rompe /credits/state).
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return None
 
-  url = f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}"
-  headers = {
-      "apikey": SUPABASE_SERVICE_ROLE_KEY,
-      "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-  }
+    url = f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}"
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+    }
 
-  async with httpx.AsyncClient() as client:
-      resp = await client.get(url, headers=headers)
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=headers)
 
-  if resp.status_code not in (200, 201):
-      logger.warning(
-          "[DASHBOARD] impossibile leggere email utente %s: %s %s",
-          user_id,
-          resp.status_code,
-          resp.text,
-      )
-      return None
+    if resp.status_code not in (200, 201):
+        logger.warning(
+            "[DASHBOARD] impossibile leggere email utente %s: %s %s",
+            user_id,
+            resp.status_code,
+            resp.text,
+        )
+        return None
 
-  data = resp.json()
-  return data.get("email")
+    data = resp.json()
+    return data.get("email")
+
 
 # ===============================
 # 🧮 /credits/state
@@ -243,6 +245,7 @@ async def get_credits_state(user: UserContext = Depends(get_current_user)):
         Piccolo shim per adattare il nostro UserContext (user_id/role)
         all'interfaccia attesa da credits_logic (user.sub / user.role).
         """
+
         def __init__(self, sub: str, role: str):
             self.sub = sub
             self.role = role
