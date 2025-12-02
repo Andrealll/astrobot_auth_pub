@@ -1,14 +1,29 @@
-# routes_credits_dashboard.py
-
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
-
+import logging  # 👈 AGGIUNTO
 import os
 import httpx
 import jwt
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 
+try:
+    from astrobot_auth.credits_logic import (
+        load_user_credits_state,
+        get_free_credits_limits,
+    )
+except ImportError:
+    # Fallback: se stai sviluppando con un credits_logic.py locale nella stessa cartella
+    from credits_logic import (
+        load_user_credits_state,
+        get_free_credits_limits,
+    )
+
+
+logger = logging.getLogger(__name__)
+
+
+    
 # ===============================
 # 🔑 CONFIG / ENV
 # ===============================
@@ -44,16 +59,40 @@ PRIVATE_KEY = load_private_key_for_dashboard()
 router = APIRouter()
 
 
-# ===============================
-# 👤 CONTEXT UTENTE DAL JWT
-# ===============================
+
+async def fetch_user_email_and_marketing(user_id: str):
+    """
+    Legge email e marketing_consent da Supabase auth.admin.
+    Ritorna (email, marketing_consent | None).
+    """
+    url = f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}"
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=headers)
+
+    if resp.status_code not in (200, 201):
+        # niente eccezione: fallback silenzioso a (None, None)
+        return None, None
+
+    data = resp.json()
+    email = data.get("email")
+    user_metadata = data.get("user_metadata") or {}
+    marketing = user_metadata.get("marketing_consent")
+    return email, marketing
+    
+
 class UserContext(BaseModel):
     user_id: str
     role: str
+    email: Optional[str] = None
+
 
 def get_current_user(authorization: str = Header(None)) -> UserContext:
     """
-    Decodifica il JWT emesso da astrobot_auth_pub e ritorna user_id + role.
+    Decodifica il JWT emesso da astrobot_auth_pub e ritorna user_id + role (+ email se presente).
     Per evitare problemi con verify/cryptography, qui non verifichiamo la firma
     ma controlliamo comunque iss e aud.
     """
@@ -78,19 +117,25 @@ def get_current_user(authorization: str = Header(None)) -> UserContext:
 
     sub = payload.get("sub")
     role = payload.get("role", "free")
+    email = payload.get("email")
     if not sub:
         raise HTTPException(status_code=401, detail="Invalid token (missing sub)")
 
-    return UserContext(user_id=sub, role=role)
+    return UserContext(user_id=sub, role=role, email=email)
+
 
 # ===============================
 # 📊 MODELLI DI RISPOSTA
 # ===============================
 class CreditsStateResponse(BaseModel):
     user_id: str
+    email: str | None = None
+    privacy_accepted: bool
+    marketing_consent: bool | None = None
     paid: int
     free_left: int
     total_available: int
+
 
 
 class UsageItem(BaseModel):
@@ -144,6 +189,39 @@ async def supabase_get(path: str, params: Optional[dict] = None) -> list:
     except Exception:
         return []
 
+# ===============================
+# HELPER
+# ===============================
+
+
+async def _fetch_user_email_from_supabase(user_id: str) -> str | None:
+  """
+  Usa l'API admin di Supabase per leggere l'email dell'utente da auth.users.
+  Ritorna None se qualcosa va storto (non rompe /credits/state).
+  """
+  if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+      return None
+
+  url = f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}"
+  headers = {
+      "apikey": SUPABASE_SERVICE_ROLE_KEY,
+      "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+  }
+
+  async with httpx.AsyncClient() as client:
+      resp = await client.get(url, headers=headers)
+
+  if resp.status_code not in (200, 201):
+      logger.warning(
+          "[DASHBOARD] impossibile leggere email utente %s: %s %s",
+          user_id,
+          resp.status_code,
+          resp.text,
+      )
+      return None
+
+  data = resp.json()
+  return data.get("email")
 
 # ===============================
 # 🧮 /credits/state
@@ -151,29 +229,46 @@ async def supabase_get(path: str, params: Optional[dict] = None) -> list:
 @router.get("/credits/state", response_model=CreditsStateResponse)
 async def get_credits_state(user: UserContext = Depends(get_current_user)):
     """
-    Restituisce lo stato crediti dell'utente loggato.
-    Usa la tabella entitlements su Supabase.
+    Restituisce lo stato crediti dell'utente (o guest) usando la stessa logica
+    di billing di credits_logic.load_user_credits_state.
     """
-    # entitlements: user_id, credits, plan, ...
-    ent_rows = await supabase_get(
-        "/rest/v1/entitlements",
-        params={"user_id": f"eq.{user.user_id}", "select": "credits"},
-    )
 
-    paid = 0
-    if ent_rows:
-        row = ent_rows[0]
-        paid = row.get("credits", 0) or 0
+    class _AuthUserShim:
+        """
+        Piccolo shim per adattare il nostro UserContext (user_id/role)
+        all'interfaccia attesa da credits_logic (user.sub / user.role).
+        """
+        def __init__(self, sub: str, role: str):
+            self.sub = sub
+            self.role = role
 
-    # free_left: se vuoi puoi leggere una tabella guests/free_tries;
-    # per ora lo teniamo a 0 e lo potrai estendere riusando la tua logica credits_logic.
-    free_left = 0
+    shim = _AuthUserShim(sub=user.user_id, role=user.role)
+    state = load_user_credits_state(shim)
 
-    total_available = paid + free_left
+    # Limiti free + free_left
+    max_free, _ = get_free_credits_limits(state)
+    free_left = max(0, max_free - (state.free_tries_used or 0))
+
+    total_available = (state.paid_credits or 0) + free_left
+
+    # Cookie policy / marketing presi da CreditsState (se presenti)
+    privacy_accepted = bool(getattr(state, "cookies_accepted", False))
+    marketing_consent = getattr(state, "marketing_consent", None)
+
+    # Email letta da Supabase auth.users (solo per utenti registrati, non guest)
+    email = None
+    try:
+        if not getattr(state, "is_guest", False):
+            email = await _fetch_user_email_from_supabase(state.user_id)
+    except Exception as e:
+        logger.warning("[DASHBOARD] errore lettura email per user_id=%s: %r", state.user_id, e)
 
     return CreditsStateResponse(
-        user_id=user.user_id,
-        paid=paid,
+        user_id=state.user_id,
+        email=email,
+        privacy_accepted=privacy_accepted,
+        marketing_consent=marketing_consent,
+        paid=state.paid_credits or 0,
         free_left=free_left,
         total_available=total_available,
     )
@@ -212,7 +307,7 @@ async def get_usage_history(user: UserContext = Depends(get_current_user)):
         try:
             when = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
         except Exception:
-            when = datetime.utcnow()
+            when = datetime.utcnow().replace(tzinfo=timezone.utc)
 
         usage_items.append(
             UsageItem(
@@ -230,7 +325,7 @@ async def get_usage_history(user: UserContext = Depends(get_current_user)):
         try:
             when = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
         except Exception:
-            when = datetime.utcnow()
+            when = datetime.utcnow().replace(tzinfo=timezone.utc)
 
         purchase_items.append(
             PurchaseItem(
