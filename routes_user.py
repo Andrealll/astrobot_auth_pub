@@ -98,6 +98,7 @@ async def update_privacy(settings: dict, user: UserContext = Depends(get_current
 
 
 
+
 # -------------------------------
 # DELETE /user/delete
 # -------------------------------
@@ -127,21 +128,20 @@ async def delete_user(user: UserContext = Depends(get_current_user)):
         },
     }
 
+    # 🔧 QUI LA MODIFICA: PATCH → PUT
     async with httpx.AsyncClient() as client:
-        resp = await client.patch(url, headers=headers, json=body)
+        resp = await client.put(url, headers=headers, json=body)
 
     status = resp.status_code
     text = resp.text or "<vuoto>"
 
-    # ✅ accettiamo 200, 201, 204 come success
     if status not in (200, 201, 204):
         raise HTTPException(
             status_code=500,
             detail=f"Supabase error {status}: {text}",
         )
 
-    return {"status": "deleted", "email": anon_email}
-
+    return {"status": "ok"}
 
 @router.post("/cookie/accept")
 async def accept_cookies(user: UserContext = Depends(get_current_user)):
