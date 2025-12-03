@@ -81,7 +81,8 @@ async def update_privacy(settings: dict, user: UserContext = Depends(get_current
     }
 
     async with httpx.AsyncClient() as client:
-        resp = await client.patch(url, headers=headers, json=patch_body)
+        # PRIMA: resp = await client.patch(...)
+        resp = await client.put(url, headers=headers, json=patch_body)
 
     status = resp.status_code
     text = resp.text or "<vuoto>"
