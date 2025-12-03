@@ -171,7 +171,7 @@ async def login(email: str = Form(...), password: str = Form(...)):
         plan = row.get("plan")
         credits = row.get("credits", 0)
 
-    if plan == "premium" or (credits and credits > 0):
+    if plan == "premium":
         role = "premium"
     else:
         role = "free"
