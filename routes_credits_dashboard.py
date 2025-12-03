@@ -253,23 +253,40 @@ async def get_credits_state(user: UserContext = Depends(get_current_user)):
     shim = _AuthUserShim(sub=user.user_id, role=user.role)
     state = load_user_credits_state(shim)
 
-    # Limiti free + free_left
+        # Limiti free + free_left
     max_free, _ = get_free_credits_limits(state)
     free_left = max(0, max_free - (state.free_tries_used or 0))
 
     total_available = (state.paid_credits or 0) + free_left
 
-    # Cookie policy / marketing presi da CreditsState (se presenti)
+    # Cookie policy / marketing: base da CreditsState (se mai lo avesse)
     privacy_accepted = bool(getattr(state, "cookies_accepted", False))
     marketing_consent = getattr(state, "marketing_consent", None)
 
-    # Email letta da Supabase auth.users (solo per utenti registrati, non guest)
+    # Email + marketing_consent letti da Supabase auth.users
     email = None
     try:
         if not getattr(state, "is_guest", False):
-            email = await _fetch_user_email_from_supabase(state.user_id)
+            email_from_auth, marketing_from_auth = await fetch_user_email_and_marketing(
+                state.user_id
+            )
+
+            # email prioritaria da auth.users
+            if email_from_auth:
+                email = email_from_auth
+
+            # se Supabase ci dà un valore, sovrascriviamo quello di CreditsState
+            if marketing_from_auth is not None:
+                if isinstance(marketing_from_auth, bool):
+                    marketing_consent = marketing_from_auth
+                elif isinstance(marketing_from_auth, str):
+                    marketing_consent = marketing_from_auth.lower() == "true"
     except Exception as e:
-        logger.warning("[DASHBOARD] errore lettura email per user_id=%s: %r", state.user_id, e)
+        logger.warning(
+            "[DASHBOARD] errore lettura email/marketing per user_id=%s: %r",
+            state.user_id,
+            e,
+        )
 
     return CreditsStateResponse(
         user_id=state.user_id,
@@ -280,6 +297,7 @@ async def get_credits_state(user: UserContext = Depends(get_current_user)):
         free_left=free_left,
         total_available=total_available,
     )
+
 
 
 # ===============================
