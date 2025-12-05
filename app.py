@@ -277,6 +277,9 @@ from routes_credits_dashboard import router as dashboard_router
 
 app.include_router(dashboard_router)
 
+@app.get("/hello", tags=["Health"])
+def hello():
+    return {"hello": "world"}
 
 from routes_user import router as user_router
 app.include_router(user_router)
