@@ -9,6 +9,13 @@ from fastapi import Depends  # se non lo hai già
 from fastapi import Body
 import stripe
 from pydantic import BaseModel
+from fastapi import Request  # per il webhook
+from routes_credits_dashboard import UserContext, get_current_user
+from astrobot_auth.credits_logic import (
+    load_user_credits_state,
+    save_user_credits_state,
+    get_supabase,
+)
 
 
 load_dotenv()
@@ -16,6 +23,7 @@ load_dotenv()
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000")
 
@@ -219,15 +227,17 @@ async def list_payment_packs():
 class CreateCheckoutRequest(BaseModel):
     pack_id: str
 
-
 @app.post("/payments/create-checkout-session")
-async def create_checkout_session(req: CreateCheckoutRequest):
+async def create_checkout_session(
+    req: CreateCheckoutRequest,
+    user: UserContext = Depends(get_current_user),
+):
     """
     Crea una sessione di pagamento Stripe Checkout per il pacchetto scelto.
 
-    - Richiede pack_id nel body.
-    - Usa PAYMENT_PACKS come unica sorgente di verità.
-    - Per ora NON collega ancora i crediti su Supabase (lo faremo via webhook).
+    - pack_id nel body
+    - user_id preso dal JWT (UserContext)
+    - metadata: pack_id + user_id
     """
     if not STRIPE_SECRET_KEY:
         raise HTTPException(
@@ -254,17 +264,14 @@ async def create_checkout_session(req: CreateCheckoutRequest):
                     "quantity": 1,
                 }
             ],
-            # Quando il pagamento va a buon fine, Stripe rimanda l’utente qui
             success_url=f"{FRONTEND_BASE_URL}/crediti/success?session_id={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{FRONTEND_BASE_URL}/crediti/cancel",
             metadata={
                 "pack_id": pack["id"],
-                # TODO in una fase successiva:
-                # "user_id": <sub dal JWT>, quando collegheremo i crediti
+                "user_id": user.user_id,  # 👈 UUID Supabase dell’utente loggato
             },
         )
     except stripe.error.StripeError as e:
-        # Non mostriamo troppi dettagli all’utente finale
         msg = getattr(e, "user_message", None) or "Errore nella creazione del pagamento Stripe."
         raise HTTPException(status_code=502, detail=msg)
 
@@ -272,6 +279,114 @@ async def create_checkout_session(req: CreateCheckoutRequest):
         "checkout_url": checkout_session.url,
         "session_id": checkout_session.id,
     }
+
+
+
+# ===============================
+# 💳 WEBHOOK STRIPE – CREDITI + PURCHASES
+# ===============================
+
+@app.post("/payments/stripe-webhook")
+async def stripe_webhook(request: Request):
+    """
+    Webhook Stripe per confermare i pagamenti ed aggiornare i crediti.
+
+    Flusso:
+    - Verifica firma con STRIPE_WEBHOOK_SECRET
+    - Gestisce solo checkout.session.completed
+    - Legge user_id + pack_id da metadata
+    - Aggiunge credits in entitlements (via credits_logic)
+    - Inserisce riga in purchases
+    """
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="Webhook Stripe non configurato")
+
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload=payload,
+            sig_header=sig_header,
+            secret=STRIPE_WEBHOOK_SECRET,
+        )
+    except stripe.error.SignatureVerificationError as e:
+        # firma non valida
+        raise HTTPException(status_code=400, detail="Invalid Stripe signature")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+
+    event_type = event["type"]
+    data = event["data"]["object"]
+
+    if event_type != "checkout.session.completed":
+        # per ora ignoriamo gli altri eventi
+        return {"status": "ignored"}
+
+    # Stripe deve confermare che il pagamento è effettivamente pagato
+    if data.get("payment_status") not in ("paid", "no_payment_required"):
+        return {"status": "ignored_not_paid"}
+
+    metadata = data.get("metadata") or {}
+    pack_id = metadata.get("pack_id")
+    user_id = metadata.get("user_id")
+
+    if not pack_id or not user_id:
+        # senza questi non possiamo aggiornare i crediti
+        return {"status": "missing_metadata"}
+
+    pack = PAYMENT_PACKS.get(pack_id)
+    if not pack:
+        # pack non più valido / non trovato
+        return {"status": "unknown_pack"}
+
+    credits_to_add = int(pack["credits"])
+    amount_eur = pack["price_eur"]
+    amount_cents = int(amount_eur * 100)
+    currency = "EUR"
+
+    # 1) Aggiorna entitlements (paid_credits) via credits_logic
+    fake_user = UserContext(user_id=user_id, role="free", email=None)
+    # lo shimmiamo in un oggetto compatibile con load_user_credits_state
+    class _Shim:
+        def __init__(self, sub: str, role: str):
+            self.sub = sub
+            self.role = role
+
+    shim = _Shim(sub=fake_user.user_id, role=fake_user.role)
+
+    state = load_user_credits_state(shim)
+    before = state.paid_credits or 0
+    state.paid_credits = before + credits_to_add
+    save_user_credits_state(state)
+    after = state.paid_credits
+
+    # 2) Inserisci riga in purchases
+    client = get_supabase()
+    if client is not None:
+        payload_db = {
+            "user_id": user_id,
+            "product": pack["name"],
+            "price_id": pack["stripe_price_id"],
+            "amount": amount_cents,
+            "currency": currency,
+            "credits_added": credits_to_add,
+            "status": "succeeded",
+        }
+        try:
+            client.table("purchases").insert(payload_db).execute()
+        except Exception:
+            # non blocchiamo il webhook se il log fallisce
+            pass
+
+    return {
+        "status": "ok",
+        "user_id": user_id,
+        "credits_before": before,
+        "credits_after": after,
+        "credits_added": credits_to_add,
+    }
+
     
 from routes_credits_dashboard import router as dashboard_router
 
