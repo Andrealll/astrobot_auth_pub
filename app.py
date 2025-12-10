@@ -5,12 +5,12 @@ from cryptography.fernet import Fernet
 import jwt, os, httpx
 from uuid import uuid4
 from dotenv import load_dotenv
-from fastapi import Depends  # se non lo hai già
-from fastapi import Body
+from fastapi import Depends, Body, Request, Header
+from typing import Optional
 import stripe
 from pydantic import BaseModel
-from fastapi import Request  # per il webhook
-from routes_credits_dashboard import UserContext, get_current_user
+
+
 from astrobot_auth.credits_logic import (
     load_user_credits_state,
     save_user_credits_state,
@@ -23,9 +23,53 @@ load_dotenv()
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
+    
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:3000")
+
+
+# ===============================
+# 👤 UserContext + JWT decode (per payments)
+# ===============================
+
+class UserContext(BaseModel):
+    user_id: str
+    role: str
+    email: Optional[str] = None
+
+
+def get_current_user(authorization: str = Header(None)) -> UserContext:
+    """
+    Decodifica il JWT emesso da questo servizio (astrobot_auth_pub)
+    e restituisce user_id + role (+ email se presente).
+    """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    token = authorization.split(" ", 1)[1].strip()
+
+    try:
+        # puoi anche decidere di NON verificare la firma (options={"verify_signature": False})
+        payload = jwt.decode(
+            token,
+            PRIVATE_KEY,
+            algorithms=["RS256"],
+            audience=AUDIENCE,
+            issuer=ISSUER,
+        )
+    except jwt.PyJWTError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+
+    sub = payload.get("sub")
+    role = payload.get("role", "free")
+    email = payload.get("email")
+
+    if not sub:
+        raise HTTPException(status_code=401, detail="Invalid token (missing sub)")
+
+    return UserContext(user_id=sub, role=role, email=email)
+
 
 # ===============================
 # 🎯 CONFIG PACCHETTI CREDITI
@@ -226,7 +270,6 @@ async def list_payment_packs():
 
 class CreateCheckoutRequest(BaseModel):
     pack_id: str
-
 @app.post("/payments/create-checkout-session")
 async def create_checkout_session(
     req: CreateCheckoutRequest,
@@ -279,8 +322,6 @@ async def create_checkout_session(
         "checkout_url": checkout_session.url,
         "session_id": checkout_session.id,
     }
-
-
 
 # ===============================
 # 💳 WEBHOOK STRIPE – CREDITI + PURCHASES
