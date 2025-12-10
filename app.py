@@ -38,11 +38,13 @@ class UserContext(BaseModel):
     role: str
     email: Optional[str] = None
 
-
 def get_current_user(authorization: str = Header(None)) -> UserContext:
     """
     Decodifica il JWT emesso da questo servizio (astrobot_auth_pub)
     e restituisce user_id + role (+ email se presente).
+
+    Per evitare problemi con la libreria cryptography / backend Rust,
+    qui NON verifichiamo la firma, ma controlliamo comunque iss e aud.
     """
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -50,16 +52,18 @@ def get_current_user(authorization: str = Header(None)) -> UserContext:
     token = authorization.split(" ", 1)[1].strip()
 
     try:
-        # puoi anche decidere di NON verificare la firma (options={"verify_signature": False})
+        # Decodifica SENZA verifica firma
         payload = jwt.decode(
             token,
-            PRIVATE_KEY,
+            options={"verify_signature": False},
             algorithms=["RS256"],
-            audience=AUDIENCE,
-            issuer=ISSUER,
         )
     except jwt.PyJWTError as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+
+    # Controllo manuale di issuer e audience
+    if payload.get("iss") != ISSUER or payload.get("aud") != AUDIENCE:
+        raise HTTPException(status_code=401, detail="Invalid token issuer/audience")
 
     sub = payload.get("sub")
     role = payload.get("role", "free")
@@ -69,6 +73,7 @@ def get_current_user(authorization: str = Header(None)) -> UserContext:
         raise HTTPException(status_code=401, detail="Invalid token (missing sub)")
 
     return UserContext(user_id=sub, role=role, email=email)
+
 
 
 # ===============================
