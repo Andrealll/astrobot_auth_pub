@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 from astrobot_auth.credits_logic import (
     CreditsState,
     load_user_credits_state,
+    _get_free_limits_for_state,  # se è funzione interna, valuta se esporla o ricopiarne la logica qui
 )
 
 # Limiti free definiti SOLO per la dashboard:
@@ -236,32 +237,55 @@ async def get_credits_state(user: UserContext = Depends(get_current_user)):
     """
     Restituisce lo stato crediti dell'utente:
 
-    - Per i guest (anon-...): usa credits_logic (guests table / fallback RAM)
-    - Per gli utenti registrati: legge i crediti da entitlements via REST
+    - Per i guest (anon-...): usa credits_logic (tabella guests / fallback RAM)
+    - Per gli utenti registrati: legge i crediti da entitlements
+      (ramo non mostrato qui, resta invariato sotto l'if).
     """
 
     is_guest = user.user_id.startswith("anon-")
 
     # ==========================================
-    # 1) GUEST → usiamo la logica esistente
+    # 1) GUEST → usiamo credits_logic
     # ==========================================
     if is_guest:
+        # Shim per adattarsi alla firma di load_user_credits_state
         class _AuthUserShim:
             def __init__(self, sub: str, role: str):
                 self.sub = sub
                 self.role = role
 
         shim = _AuthUserShim(sub=user.user_id, role=user.role)
+
+        # Stato completo (paid_credits, free_tries_used, cookies_accepted, ecc.)
         state = load_user_credits_state(shim)
 
-        max_free, _ = get_free_credits_limits(state)
-        free_left = max(0, max_free - (state.free_tries_used or 0))
+        # Limiti free per questo stato (guest → GUEST_FREE_CREDITS_PER_PERIOD, ecc.)
+        max_free_credits, _ = get_free_credits_limits(state)
+
+        # Crediti gratuiti già usati nel periodo corrente
+        free_used = state.free_tries_used or 0
+
+        # Crediti gratuiti ancora disponibili
+        free_left = max(0, max_free_credits - free_used)
+
+        # Crediti pagati (per i guest sarà sempre 0)
         paid = state.paid_credits or 0
+
+        # Totale disponibile = pagati + gratuiti rimanenti
         total_available = paid + free_left
 
+        # Flag privacy / marketing dal CreditsState
         privacy_accepted = bool(getattr(state, "cookies_accepted", False))
         marketing_consent = getattr(state, "marketing_consent", None)
-
+        logger.info(
+            "[AUTH] /credits/state GUEST user_id=%s paid=%s free_used=%s max_free=%s free_left=%s total=%s",
+            state.user_id,
+            paid,
+            free_used,
+            max_free_credits,
+            free_left,
+            total_available,
+        )
         return CreditsStateResponse(
             user_id=state.user_id,
             email=None,
@@ -272,6 +296,7 @@ async def get_credits_state(user: UserContext = Depends(get_current_user)):
             free_left=free_left,
             total_available=total_available,
         )
+
 
     # ==========================================
     # 2) UTENTE REGISTRATO → entitlements REST
