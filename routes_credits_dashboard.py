@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-# 👇 IMPORT UNICO DA astrobot_auth (senza fallback locale)
+# 👇 IMPORT UNICO DA astrobot_auth (per la logica guest)
 from astrobot_auth.credits_logic import (
     CreditsState,
     load_user_credits_state,
@@ -27,8 +27,6 @@ def get_free_credits_limits(state: CreditsState) -> tuple[int, int]:
     - registered: 0 free
     """
     if getattr(state, "is_guest", False):
-        # 2 tentativi free, 1 "credito free" per tentativo
-        # (in questa route usiamo solo max_free per calcolare free_left)
         return 2, 1
     return 0, 0
 
@@ -101,8 +99,7 @@ class UserContext(BaseModel):
 def get_current_user(authorization: str = Header(None)) -> UserContext:
     """
     Decodifica il JWT emesso da astrobot_auth_pub e ritorna user_id + role (+ email se presente).
-    Per evitare problemi con verify/cryptography, qui non verifichiamo la firma
-    ma controlliamo comunque iss e aud.
+    Qui NON verifichiamo la firma, ma controlliamo iss e aud.
     """
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -110,7 +107,6 @@ def get_current_user(authorization: str = Header(None)) -> UserContext:
     token = authorization.split(" ", 1)[1].strip()
 
     try:
-        # ⚠️ Decodifica SENZA verifica firma
         payload = jwt.decode(
             token,
             options={"verify_signature": False},
@@ -119,7 +115,6 @@ def get_current_user(authorization: str = Header(None)) -> UserContext:
     except jwt.PyJWTError as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
-    # Controllo manuale di issuer e audience per un minimo di sanità
     if payload.get("iss") != ISSUER or payload.get("aud") != AUDIENCE:
         raise HTTPException(status_code=401, detail="Invalid token issuer/audience")
 
@@ -138,6 +133,7 @@ def get_current_user(authorization: str = Header(None)) -> UserContext:
 class CreditsStateResponse(BaseModel):
     user_id: str
     email: str | None = None
+    role: str | None = None
     privacy_accepted: bool
     marketing_consent: bool | None = None
     paid: int
@@ -151,7 +147,9 @@ class UsageItem(BaseModel):
     feature: str
     scope: Optional[str] = None
     tier: Optional[str] = None
-    credits_used: int
+    billing_mode: Optional[str] = None  # "free" / "paid" / ecc.
+    cost_paid_credits: int = 0
+    cost_free_credits: int = 0
 
 
 class PurchaseItem(BaseModel):
@@ -236,68 +234,102 @@ async def _fetch_user_email_from_supabase(user_id: str) -> str | None:
 @router.get("/credits/state", response_model=CreditsStateResponse)
 async def get_credits_state(user: UserContext = Depends(get_current_user)):
     """
-    Restituisce lo stato crediti dell'utente (o guest) usando la stessa logica
-    di billing di credits_logic.load_user_credits_state.
+    Restituisce lo stato crediti dell'utente:
+
+    - Per i guest (anon-...): usa credits_logic (guests table / fallback RAM)
+    - Per gli utenti registrati: legge i crediti da entitlements via REST
     """
 
-    class _AuthUserShim:
-        """
-        Piccolo shim per adattare il nostro UserContext (user_id/role)
-        all'interfaccia attesa da credits_logic (user.sub / user.role).
-        """
+    is_guest = user.user_id.startswith("anon-")
 
-        def __init__(self, sub: str, role: str):
-            self.sub = sub
-            self.role = role
+    # ==========================================
+    # 1) GUEST → usiamo la logica esistente
+    # ==========================================
+    if is_guest:
+        class _AuthUserShim:
+            def __init__(self, sub: str, role: str):
+                self.sub = sub
+                self.role = role
 
-    shim = _AuthUserShim(sub=user.user_id, role=user.role)
-    state = load_user_credits_state(shim)
+        shim = _AuthUserShim(sub=user.user_id, role=user.role)
+        state = load_user_credits_state(shim)
 
-        # Limiti free + free_left
-    max_free, _ = get_free_credits_limits(state)
-    free_left = max(0, max_free - (state.free_tries_used or 0))
+        max_free, _ = get_free_credits_limits(state)
+        free_left = max(0, max_free - (state.free_tries_used or 0))
+        paid = state.paid_credits or 0
+        total_available = paid + free_left
 
-    total_available = (state.paid_credits or 0) + free_left
+        privacy_accepted = bool(getattr(state, "cookies_accepted", False))
+        marketing_consent = getattr(state, "marketing_consent", None)
 
-    # Cookie policy / marketing: base da CreditsState (se mai lo avesse)
-    privacy_accepted = bool(getattr(state, "cookies_accepted", False))
-    marketing_consent = getattr(state, "marketing_consent", None)
+        return CreditsStateResponse(
+            user_id=state.user_id,
+            email=None,
+            role="guest",
+            privacy_accepted=privacy_accepted,
+            marketing_consent=marketing_consent,
+            paid=paid,
+            free_left=free_left,
+            total_available=total_available,
+        )
 
-    # Email + marketing_consent letti da Supabase auth.users
+    # ==========================================
+    # 2) UTENTE REGISTRATO → entitlements REST
+    # ==========================================
+    # Leggi credits da entitlements
+    ent_rows = await supabase_get(
+        "/rest/v1/entitlements",
+        params={
+            "user_id": f"eq.{user.user_id}",
+            "select": "credits",
+        },
+    )
+
+    if ent_rows:
+        row = ent_rows[0]
+        paid = int(row.get("credits") or 0)
+    else:
+        # Nessuna riga in entitlements → 0 crediti
+        paid = 0
+
+    # Per ora, da dashboard non mostriamo free ricorrenti per i registrati
+    free_left = 0
+    total_available = paid + free_left
+
+    # Email + marketing_consent da auth.users
     email = None
+    marketing_consent = None
     try:
-        if not getattr(state, "is_guest", False):
-            email_from_auth, marketing_from_auth = await fetch_user_email_and_marketing(
-                state.user_id
-            )
-
-            # email prioritaria da auth.users
-            if email_from_auth:
-                email = email_from_auth
-
-            # se Supabase ci dà un valore, sovrascriviamo quello di CreditsState
-            if marketing_from_auth is not None:
-                if isinstance(marketing_from_auth, bool):
-                    marketing_consent = marketing_from_auth
-                elif isinstance(marketing_from_auth, str):
-                    marketing_consent = marketing_from_auth.lower() == "true"
+        email_from_auth, marketing_from_auth = await fetch_user_email_and_marketing(
+            user.user_id
+        )
+        if email_from_auth:
+            email = email_from_auth
+        if marketing_from_auth is not None:
+            if isinstance(marketing_from_auth, bool):
+                marketing_consent = marketing_from_auth
+            elif isinstance(marketing_from_auth, str):
+                marketing_consent = marketing_from_auth.lower() == "true"
     except Exception as e:
         logger.warning(
             "[DASHBOARD] errore lettura email/marketing per user_id=%s: %r",
-            state.user_id,
+            user.user_id,
             e,
         )
 
+    # privacy_accepted: per ora non hai un flag certo lato dashboard → False
+    privacy_accepted = False
+
     return CreditsStateResponse(
-        user_id=state.user_id,
+        user_id=user.user_id,
         email=email,
+        role=user.role,
         privacy_accepted=privacy_accepted,
         marketing_consent=marketing_consent,
-        paid=state.paid_credits or 0,
+        paid=paid,
         free_left=free_left,
         total_available=total_available,
     )
-
 
 
 # ===============================
@@ -335,6 +367,13 @@ async def get_usage_history(user: UserContext = Depends(get_current_user)):
         except Exception:
             when = datetime.utcnow().replace(tzinfo=timezone.utc)
 
+        cost_paid = row.get("cost_paid_credits")
+        cost_free = row.get("cost_free_credits")
+
+        # compatibilità vecchia colonna cost_credits
+        if cost_paid is None and "cost_credits" in row:
+            cost_paid = row.get("cost_credits")
+
         usage_items.append(
             UsageItem(
                 id=row.get("id", 0),
@@ -342,7 +381,9 @@ async def get_usage_history(user: UserContext = Depends(get_current_user)):
                 feature=row.get("feature", "unknown"),
                 scope=row.get("scope"),
                 tier=row.get("tier"),
-                credits_used=row.get("credits_used", 0) or 0,
+                billing_mode=row.get("billing_mode"),
+                cost_paid_credits=int(cost_paid or 0),
+                cost_free_credits=int(cost_free or 0),
             )
         )
 
