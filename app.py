@@ -117,8 +117,10 @@ app = FastAPI(title="AstroBot Auth Pub", version="2.0")
 ALLOWED_ORIGINS = [
     "https://dyana.app",
     "http://localhost:3000",
-    "http://172.20.10.2:3000",  # 👈 AGGIUNTO per test da cellulare
+    "http://127.0.0.1:3000",   # ✅ QUESTA MANCAVA
+    "http://172.20.10.2:3000",
 ]
+
 
 app.add_middleware(
     CORSMiddleware,

@@ -15,20 +15,17 @@ from astrobot_auth.credits_logic import (
     load_user_credits_state,
     _get_free_limits_for_state,  # se è funzione interna, valuta se esporla o ricopiarne la logica qui
 )
-
+from astrobot_auth.settings_credits import (
+    GUEST_FREE_CREDITS_PER_PERIOD,
+    GUEST_FREE_CREDITS_PERIOD_DAYS,
+)
 # Limiti free definiti SOLO per la dashboard:
 # - guest: 2 prove gratuite
 # - utente registrato: 0 free
 def get_free_credits_limits(state: CreditsState) -> tuple[int, int]:
-    """
-    Ritorna (max_free_tries, free_credits_per_try) per il tipo di utente.
-
-    Per ora:
-    - guest: 2 tentativi free
-    - registered: 0 free
-    """
     if getattr(state, "is_guest", False):
-        return 2, 1
+        # usa i valori REALI definiti in settings_credits
+        return GUEST_FREE_CREDITS_PER_PERIOD, GUEST_FREE_CREDITS_PERIOD_DAYS
     return 0, 0
 
 
@@ -229,73 +226,89 @@ async def _fetch_user_email_from_supabase(user_id: str) -> str | None:
     return data.get("email")
 
 
+
 # ===============================
 # 🧮 /credits/state
 # ===============================
 @router.get("/credits/state", response_model=CreditsStateResponse)
 async def get_credits_state(user: UserContext = Depends(get_current_user)):
     """
-    Restituisce lo stato crediti dell'utente:
+    Restituisce lo stato crediti dell'utente usando ESATTAMENTE la stessa
+    logica di astrobot_auth.credits_logic:
 
-    - Per i guest (anon-...): usa credits_logic (tabella guests / fallback RAM)
-    - Per gli utenti registrati: legge i crediti da entitlements
-      (ramo non mostrato qui, resta invariato sotto l'if).
+    - load_user_credits_state → legge entitlements / guests
+    - _get_free_limits_for_state → calcola il massimo di free credits
     """
 
-    is_guest = user.user_id.startswith("anon-")
+    # Shim per adattare UserContext (user_id/role) alla firma di credits_logic
+    class _AuthUserShim:
+        def __init__(self, sub: str, role: str):
+            self.sub = sub
+            self.role = role
 
-    # ==========================================
-    # 1) GUEST → usiamo credits_logic
-    # ==========================================
-    if is_guest:
-        # Shim per adattarsi alla firma di load_user_credits_state
-        class _AuthUserShim:
-            def __init__(self, sub: str, role: str):
-                self.sub = sub
-                self.role = role
+    shim = _AuthUserShim(sub=user.user_id, role=user.role)
 
-        shim = _AuthUserShim(sub=user.user_id, role=user.role)
+    # Stato completo (paid_credits, free_tries_used, is_guest, cookies_accepted, ecc.)
+    state = load_user_credits_state(shim)
 
-        # Stato completo (paid_credits, free_tries_used, cookies_accepted, ecc.)
-        state = load_user_credits_state(shim)
+    # Limiti free REALI (usano settings_credits e la stessa logica del consumo)
+    max_free_credits, _ = _get_free_limits_for_state(state)
+    free_used = state.free_tries_used or 0
+    free_left = max(0, max_free_credits - free_used)
 
-        # Limiti free per questo stato (guest → GUEST_FREE_CREDITS_PER_PERIOD, ecc.)
-        max_free_credits, _ = get_free_credits_limits(state)
+    paid = state.paid_credits or 0
+    total_available = paid + free_left
 
-        # Crediti gratuiti già usati nel periodo corrente
-        free_used = state.free_tries_used or 0
+    # Flag privacy/marketing dal CreditsState (se presenti)
+    privacy_accepted = bool(getattr(state, "cookies_accepted", False))
+    marketing_consent = getattr(state, "marketing_consent", None)
 
-        # Crediti gratuiti ancora disponibili
-        free_left = max(0, max_free_credits - free_used)
-
-        # Crediti pagati (per i guest sarà sempre 0)
-        paid = state.paid_credits or 0
-
-        # Totale disponibile = pagati + gratuiti rimanenti
-        total_available = paid + free_left
-
-        # Flag privacy / marketing dal CreditsState
-        privacy_accepted = bool(getattr(state, "cookies_accepted", False))
-        marketing_consent = getattr(state, "marketing_consent", None)
-        logger.info(
-            "[AUTH] /credits/state GUEST user_id=%s paid=%s free_used=%s max_free=%s free_left=%s total=%s",
+    # Email + marketing_consent da Supabase auth.users SOLO per utenti registrati
+    email = None
+    try:
+        if not state.is_guest:
+            email_from_auth, marketing_from_auth = await fetch_user_email_and_marketing(
+                state.user_id
+            )
+            if email_from_auth:
+                email = email_from_auth
+            if marketing_from_auth is not None:
+                if isinstance(marketing_from_auth, bool):
+                    marketing_consent = marketing_from_auth
+                elif isinstance(marketing_from_auth, str):
+                    marketing_consent = marketing_from_auth.lower() == "true"
+    except Exception as e:
+        logger.warning(
+            "[DASHBOARD] errore lettura email/marketing per user_id=%s: %r",
             state.user_id,
-            paid,
-            free_used,
-            max_free_credits,
-            free_left,
-            total_available,
+            e,
         )
-        return CreditsStateResponse(
-            user_id=state.user_id,
-            email=None,
-            role="guest",
-            privacy_accepted=privacy_accepted,
-            marketing_consent=marketing_consent,
-            paid=paid,
-            free_left=free_left,
-            total_available=total_available,
-        )
+
+    # Ruolo esposto alla UI
+    role_out = "guest" if state.is_guest else user.role
+
+    logger.info(
+        "[AUTH] /credits/state user_id=%s is_guest=%s role=%s paid=%s free_used=%s max_free=%s free_left=%s total=%s",
+        state.user_id,
+        state.is_guest,
+        role_out,
+        paid,
+        free_used,
+        max_free_credits,
+        free_left,
+        total_available,
+    )
+
+    return CreditsStateResponse(
+        user_id=state.user_id,
+        email=email,
+        role=role_out,
+        privacy_accepted=privacy_accepted,
+        marketing_consent=marketing_consent,
+        paid=paid,
+        free_left=free_left,
+        total_available=total_available,
+    )
 
 
     # ==========================================
