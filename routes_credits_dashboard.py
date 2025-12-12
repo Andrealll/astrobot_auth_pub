@@ -137,6 +137,8 @@ class CreditsStateResponse(BaseModel):
     paid: int
     free_left: int
     total_available: int
+    remaining_credits: int  # ✅ nuovo: campo unificato per la UI
+
 
 
 class UsageItem(BaseModel):
@@ -258,7 +260,10 @@ async def get_credits_state(user: UserContext = Depends(get_current_user)):
 
     paid = state.paid_credits or 0
     total_available = paid + free_left
-
+    # ✅ remaining_credits unificato:
+    # - per guest: è free_left (wallet=0)
+    # - per registrati: paid+free_left (se vuoi mostrare totale spendibile)
+    remaining_credits = free_left if state.is_guest else total_available
     # Flag privacy/marketing dal CreditsState (se presenti)
     privacy_accepted = bool(getattr(state, "cookies_accepted", False))
     marketing_consent = getattr(state, "marketing_consent", None)
@@ -308,6 +313,8 @@ async def get_credits_state(user: UserContext = Depends(get_current_user)):
         paid=paid,
         free_left=free_left,
         total_available=total_available,
+        remaining_credits=remaining_credits,  
+
     )
 
 
