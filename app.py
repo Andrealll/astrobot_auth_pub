@@ -81,14 +81,21 @@ def get_current_user(authorization: str = Header(None)) -> UserContext:
 # ===============================
 # Unico punto di verità lato backend.
 # Il frontend leggerà questi pacchetti via /payments/packs.
+
+def _env(key: str, default: str = "") -> str:
+    v = os.getenv(key)
+    return v.strip() if v else default
+
+
+
 PAYMENT_PACKS = {
     "small": {
         "id": "small",
-        "name": "Provami!",
+        "name": "Provami!(DEPLOY CHECK)",
         "description": "Per iniziare a provare le letture premium.",
         "credits": 10,
         "price_eur": 9,
-        "stripe_price_id": "price_1SZEwz69hKKhw0M9qVqJjak9",  # TODO: imposta l'ID del prezzo Stripe quando lo crei
+        "stripe_price_id": _env("STRIPE_PRICE_SMALL", "price_1SZEwz69hKKhw0M9qVqJjak9"),
     },
     "medium": {
         "id": "medium",
@@ -96,7 +103,8 @@ PAYMENT_PACKS = {
         "description": "Per usare DYANA con continuità.",
         "credits": 30,
         "price_eur": 19,
-        "stripe_price_id": "price_1SZEy669hKKhw0M92Kw6WDKQ",  # TODO
+        "stripe_price_id": _env("STRIPE_PRICE_MEDIUM", "price_1SZEy669hKKhw0M92Kw6WDKQ"),
+
     },
     "large": {
         "id": "large",
@@ -104,7 +112,7 @@ PAYMENT_PACKS = {
         "description": "Per power user e super appassionati.",
         "credits": 80,
         "price_eur": 39,
-        "stripe_price_id": "price_1SZEzM69hKKhw0M9I0wcOfpL",  # TODO
+        "stripe_price_id": _env("STRIPE_PRICE_LARGE",  "price_1SZEzM69hKKhw0M9I0wcOfpL"),
     },
 }
 
