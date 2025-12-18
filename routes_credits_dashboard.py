@@ -16,8 +16,9 @@ from astrobot_auth.credits_logic import (
     _get_free_limits_for_state,  # se è funzione interna, valuta se esporla o ricopiarne la logica qui
 )
 from astrobot_auth.settings_credits import (
-    GUEST_FREE_CREDITS_PER_PERIOD,
-    GUEST_FREE_CREDITS_PERIOD_DAYS,
+    USER_FREE_CREDITS_PER_PERIOD,
+    USER_FREE_CREDITS_PERIOD_DAYS,
+    INITIAL_SIGNUP_CREDITS,
 )
 # Limiti free definiti SOLO per la dashboard:
 # - guest: 2 prove gratuite
@@ -132,12 +133,26 @@ class CreditsStateResponse(BaseModel):
     user_id: str
     email: str | None = None
     role: str | None = None
+
+    # privacy/marketing
     privacy_accepted: bool
     marketing_consent: bool | None = None
+
+    # wallets
     paid: int
     free_left: int
     total_available: int
-    remaining_credits: int  # ✅ nuovo: campo unificato per la UI
+    remaining_credits: int  # per UI: guest=trial(0/1), user=total
+
+    # NEW: funnel/trial info
+    is_guest: bool
+    trial_available: int  # 1 se guest e trial non usato, altrimenti 0
+
+    # NEW: parametri per frontend (N e X + bonus signup)
+    free_grant_amount: int
+    free_grant_interval_days: int
+    signup_credits: int
+
 
 
 
@@ -235,46 +250,30 @@ async def _fetch_user_email_from_supabase(user_id: str) -> str | None:
 @router.get("/credits/state", response_model=CreditsStateResponse)
 async def get_credits_state(user: UserContext = Depends(get_current_user)):
     """
-    Restituisce lo stato crediti dell'utente usando ESATTAMENTE la stessa
-    logica di astrobot_auth.credits_logic:
+    Stato crediti allineato al nuovo modello:
 
-    - load_user_credits_state → legge entitlements / guests
-    - _get_free_limits_for_state → calcola il massimo di free credits
+    - Guest: free trial one-shot (trial_available 1/0). Niente free_left periodico.
+    - User: paid=credits, free_left=free_credits_balance (dopo lazy grant), total=paid+free_left.
+    - Espone N, X e signup_credits al frontend.
     """
 
-    # Shim per adattare UserContext (user_id/role) alla firma di credits_logic
     class _AuthUserShim:
         def __init__(self, sub: str, role: str):
             self.sub = sub
             self.role = role
 
     shim = _AuthUserShim(sub=user.user_id, role=user.role)
-
-    # Stato completo (paid_credits, free_tries_used, is_guest, cookies_accepted, ecc.)
     state = load_user_credits_state(shim)
 
-    # Limiti free REALI (usano settings_credits e la stessa logica del consumo)
-    max_free_credits, _ = _get_free_limits_for_state(state)
-    free_used = state.free_tries_used or 0
-    free_left = max(0, max_free_credits - free_used)
-
-    paid = state.paid_credits or 0
-    total_available = paid + free_left
-    # ✅ remaining_credits unificato:
-    # - per guest: è free_left (wallet=0)
-    # - per registrati: paid+free_left (se vuoi mostrare totale spendibile)
-    remaining_credits = free_left if state.is_guest else total_available
-    # Flag privacy/marketing dal CreditsState (se presenti)
+    # Flags privacy/marketing dal CreditsState
     privacy_accepted = bool(getattr(state, "cookies_accepted", False))
     marketing_consent = getattr(state, "marketing_consent", None)
 
     # Email + marketing_consent da Supabase auth.users SOLO per utenti registrati
     email = None
-    try:
-        if not state.is_guest:
-            email_from_auth, marketing_from_auth = await fetch_user_email_and_marketing(
-                state.user_id
-            )
+    if not state.is_guest:
+        try:
+            email_from_auth, marketing_from_auth = await fetch_user_email_and_marketing(state.user_id)
             if email_from_auth:
                 email = email_from_auth
             if marketing_from_auth is not None:
@@ -282,25 +281,49 @@ async def get_credits_state(user: UserContext = Depends(get_current_user)):
                     marketing_consent = marketing_from_auth
                 elif isinstance(marketing_from_auth, str):
                     marketing_consent = marketing_from_auth.lower() == "true"
-    except Exception as e:
-        logger.warning(
-            "[DASHBOARD] errore lettura email/marketing per user_id=%s: %r",
-            state.user_id,
-            e,
-        )
+        except Exception as e:
+            logger.warning("[DASHBOARD] errore lettura email/marketing user_id=%s: %r", state.user_id, e)
 
     # Ruolo esposto alla UI
     role_out = "guest" if state.is_guest else user.role
 
+    # --- NEW MODEL ---
+    if state.is_guest:
+        # Guest: 1 free trial one-shot (non crediti)
+        trial_available = 0 if getattr(state, "free_trial_used", False) else 1
+
+        paid = 0
+        free_left = trial_available   
+        total_available = trial_available
+        remaining_credits = trial_available
+
+        # Parametri FE (N/X): per guest esponiamo i DEFAULT user (utile per UI/marketing)
+        free_grant_amount = int(USER_FREE_CREDITS_PER_PERIOD or 0)
+        free_grant_interval_days = int(USER_FREE_CREDITS_PERIOD_DAYS or 0)
+        signup_credits = int(INITIAL_SIGNUP_CREDITS or 0)
+
+    else:
+        # User: credits + free periodic wallet
+        paid = int(getattr(state, "paid_credits", 0) or 0)
+        free_left = int(getattr(state, "free_credits_balance", 0) or 0)
+
+        total_available = paid + free_left
+        remaining_credits = total_available
+        trial_available = 0
+
+        # Parametri FE: idealmente quelli salvati in entitlements; fallback ai default env
+        free_grant_amount = int(getattr(state, "free_grant_amount", USER_FREE_CREDITS_PER_PERIOD) or 0)
+        free_grant_interval_days = int(getattr(state, "free_grant_interval_days", USER_FREE_CREDITS_PERIOD_DAYS) or 0)
+        signup_credits = int(INITIAL_SIGNUP_CREDITS or 0)
+
     logger.info(
-        "[AUTH] /credits/state user_id=%s is_guest=%s role=%s paid=%s free_used=%s max_free=%s free_left=%s total=%s",
+        "[AUTH] /credits/state user_id=%s is_guest=%s role=%s paid=%s free_left=%s trial_available=%s total=%s",
         state.user_id,
         state.is_guest,
         role_out,
         paid,
-        free_used,
-        max_free_credits,
         free_left,
+        trial_available,
         total_available,
     )
 
@@ -313,68 +336,14 @@ async def get_credits_state(user: UserContext = Depends(get_current_user)):
         paid=paid,
         free_left=free_left,
         total_available=total_available,
-        remaining_credits=remaining_credits,  
-
+        remaining_credits=remaining_credits,
+        is_guest=bool(state.is_guest),
+        trial_available=int(trial_available),
+        free_grant_amount=int(free_grant_amount),
+        free_grant_interval_days=int(free_grant_interval_days),
+        signup_credits=int(signup_credits),
     )
 
-
-    # ==========================================
-    # 2) UTENTE REGISTRATO → entitlements REST
-    # ==========================================
-    # Leggi credits da entitlements
-    ent_rows = await supabase_get(
-        "/rest/v1/entitlements",
-        params={
-            "user_id": f"eq.{user.user_id}",
-            "select": "credits",
-        },
-    )
-
-    if ent_rows:
-        row = ent_rows[0]
-        paid = int(row.get("credits") or 0)
-    else:
-        # Nessuna riga in entitlements → 0 crediti
-        paid = 0
-
-    # Per ora, da dashboard non mostriamo free ricorrenti per i registrati
-    free_left = 0
-    total_available = paid + free_left
-
-    # Email + marketing_consent da auth.users
-    email = None
-    marketing_consent = None
-    try:
-        email_from_auth, marketing_from_auth = await fetch_user_email_and_marketing(
-            user.user_id
-        )
-        if email_from_auth:
-            email = email_from_auth
-        if marketing_from_auth is not None:
-            if isinstance(marketing_from_auth, bool):
-                marketing_consent = marketing_from_auth
-            elif isinstance(marketing_from_auth, str):
-                marketing_consent = marketing_from_auth.lower() == "true"
-    except Exception as e:
-        logger.warning(
-            "[DASHBOARD] errore lettura email/marketing per user_id=%s: %r",
-            user.user_id,
-            e,
-        )
-
-    # privacy_accepted: per ora non hai un flag certo lato dashboard → False
-    privacy_accepted = False
-
-    return CreditsStateResponse(
-        user_id=user.user_id,
-        email=email,
-        role=user.role,
-        privacy_accepted=privacy_accepted,
-        marketing_consent=marketing_consent,
-        paid=paid,
-        free_left=free_left,
-        total_available=total_available,
-    )
 
 
 # ===============================

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Form
+from fastapi import FastAPI, HTTPException, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
 from cryptography.fernet import Fernet
@@ -124,10 +124,12 @@ app = FastAPI(title="AstroBot Auth Pub", version="2.0")
 # ✅ ORIGINI PERMESSE
 ALLOWED_ORIGINS = [
     "https://dyana.app",
+    "https://www.dyana.app",
     "http://localhost:3000",
-    "http://127.0.0.1:3000",   # ✅ QUESTA MANCAVA
+    "http://127.0.0.1:3000",
     "http://172.20.10.2:3000",
 ]
+
 
 
 app.add_middleware(
@@ -183,10 +185,35 @@ def root():
 # ======================================================
 # 🆓 ANONYMOUS LOGIN
 # ======================================================
+from fastapi import Header, HTTPException
+
 @app.get("/auth/anonymous")
-async def anonymous_login():
-    anon_id = f"anon-{uuid4()}"
+async def anonymous_login(
+    x_device_id: str | None = Header(default=None),
+):
+    if not x_device_id:
+        raise HTTPException(status_code=400, detail="Missing X-Device-Id")
+
+    anon_id = f"anon-{x_device_id}"
     return create_access_token_response(sub=anon_id, role="free")
+
+
+# ======================================================
+# 🔐 LOGIN VIA SUPABASE (MAGIC LINK)
+# ======================================================
+
+# ✅ Import dal package installato "astrobot_auth"
+from auth.magiclink.routes_auth_magiclink import (
+    router as auth_magiclink_router,
+    get_token_creator,
+)
+
+# ✅ Iniezione del token creator (evita import circolare nel router)
+app.dependency_overrides[get_token_creator] = lambda: create_access_token_response
+
+# ✅ Include router
+app.include_router(auth_magiclink_router)
+print("[AUTH] app.py file =", __file__)
 
 # ======================================================
 # 🔐 LOGIN VIA SUPABASE
