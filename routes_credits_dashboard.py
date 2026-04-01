@@ -264,7 +264,16 @@ async def get_credits_state(user: UserContext = Depends(get_current_user)):
 
     shim = _AuthUserShim(sub=user.user_id, role=user.role)
     state = load_user_credits_state(shim)
-
+    logger.warning(
+        "### CREDITS_STATE DEBUG user_id=%s role_in=%s role_out=%s is_guest=%s paid_credits=%s free_credits_balance=%s free_trial_used=%s",
+        state.user_id,
+        user.role,
+        "guest" if state.is_guest else user.role,
+        state.is_guest,
+        getattr(state, "paid_credits", None),
+        getattr(state, "free_credits_balance", None),
+        getattr(state, "free_trial_used", None),
+    )
     # Flags privacy/marketing dal CreditsState
     privacy_accepted = bool(getattr(state, "cookies_accepted", False))
     marketing_consent = getattr(state, "marketing_consent", None)

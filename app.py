@@ -52,21 +52,31 @@ def get_current_user(authorization: str = Header(None)) -> UserContext:
     token = authorization.split(" ", 1)[1].strip()
 
     try:
-        # Decodifica SENZA verifica firma
         payload = jwt.decode(
             token,
-            options={"verify_signature": False},
+            key=PUBLIC_KEY,
             algorithms=["RS256"],
+            issuer=ISSUER,
+            audience=AUDIENCE,
+            options={
+                "require": ["sub", "iss", "aud", "iat", "exp"],
+                "verify_exp": True,
+            },
+            leeway=30,
         )
-    except jwt.PyJWTError as e:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
     # Controllo manuale di issuer e audience
     if payload.get("iss") != ISSUER or payload.get("aud") != AUDIENCE:
         raise HTTPException(status_code=401, detail="Invalid token issuer/audience")
 
     sub = payload.get("sub")
-    role = payload.get("role", "free")
+    role = payload.get("role", "free") or "free"
+    if role not in ("free", "premium"):
+        role = "free"
     email = payload.get("email")
 
     if not sub:
@@ -91,11 +101,11 @@ def _env(key: str, default: str = "") -> str:
 PAYMENT_PACKS = {
     "small": {
         "id": "small",
-        "name": "Provami!(DEPLOY CHECK)",
+        "name": "Provami!",
         "description": "Per iniziare a provare le letture premium.",
         "credits": 10,
         "price_eur": 9,
-        "stripe_price_id": _env("STRIPE_PRICE_SMALL", "price_1SZEwz69hKKhw0M9qVqJjak9"),
+        "stripe_price_id": _env("test", "price_1T0MpD6LbfOjyQH3PTxK7o0p"),
     },
     "medium": {
         "id": "medium",
@@ -157,6 +167,14 @@ PRIVATE_KEY = load_private_key()
 ISSUER = os.getenv("AUTH_ISSUER", "astrobot-auth-pub")
 AUDIENCE = os.getenv("AUTH_AUDIENCE", "chatbot-test")
 
+def _load_public_key() -> bytes:
+    pem = os.getenv("AUTH_PUBLIC_KEY_PEM")
+    if pem:
+        return pem.encode("utf-8")
+    path = os.getenv("AUTH_PUBLIC_KEY_PATH", "secrets/jwtRS256.key.pub")
+    return open(path, "rb").read()
+
+PUBLIC_KEY = _load_public_key()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
@@ -193,7 +211,13 @@ async def anonymous_login(
 ):
     if not x_device_id:
         raise HTTPException(status_code=400, detail="Missing X-Device-Id")
+    x_device_id = x_device_id.strip()
 
+    if len(x_device_id) < 16:
+        raise HTTPException(status_code=400, detail="Invalid X-Device-Id")
+
+    if len(x_device_id) > 128:
+        raise HTTPException(status_code=400, detail="Invalid X-Device-Id")
     anon_id = f"anon-{x_device_id}"
     return create_access_token_response(sub=anon_id, role="free")
 
@@ -481,3 +505,7 @@ def hello():
 
 from routes_user import router as user_router
 app.include_router(user_router)
+
+
+from astrobot_auth.auth.billing.routes_billing import router as billing_router
+app.include_router(billing_router)

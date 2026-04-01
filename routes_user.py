@@ -15,9 +15,20 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 ISSUER = os.getenv("AUTH_ISSUER", "astrobot-auth-pub")
 AUDIENCE = os.getenv("AUTH_AUDIENCE", "chatbot-test")
 
+def _load_public_key() -> bytes:
+    pem = os.getenv("AUTH_PUBLIC_KEY_PEM")
+    if pem:
+        return pem.encode("utf-8")
+    path = os.getenv("AUTH_PUBLIC_KEY_PATH", "secrets/jwtRS256.key.pub")
+    try:
+        return open(path, "rb").read()
+    except Exception as e:
+        raise RuntimeError(f"Missing public key file at {path}: {e}")
+
+PUBLIC_KEY = _load_public_key()
 
 # -------------------------------
-# JWT Decoding (stessa logica dashboard)
+# JWT Decoding (SAFE)
 # -------------------------------
 class UserContext:
     def __init__(self, user_id: str, role: str):
@@ -32,13 +43,22 @@ def get_current_user(authorization: str = Header(None)) -> UserContext:
     token = authorization.split(" ", 1)[1].strip()
 
     try:
-        # Decodifica senza verifica firma, ma controlliamo iss/aud
-        payload = jwt.decode(token, options={"verify_signature": False})
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    if payload.get("iss") != ISSUER or payload.get("aud") != AUDIENCE:
-        raise HTTPException(status_code=401, detail="Invalid token issuer/audience")
+        payload = jwt.decode(
+            token,
+            key=PUBLIC_KEY,
+            algorithms=["RS256"],
+            issuer=ISSUER,
+            audience=AUDIENCE,
+            options={
+                "require": ["sub", "iss", "aud", "iat", "exp"],
+                "verify_exp": True,
+            },
+            leeway=30,
+        )
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.PyJWTError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
     sub = payload.get("sub")
     if not sub:
