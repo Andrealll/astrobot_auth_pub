@@ -507,5 +507,5 @@ from routes_user import router as user_router
 app.include_router(user_router)
 
 
-from astrobot_auth.auth.billing.routes_billing import router as billing_router
+from auth.billing.routes_billing import router as billing_router
 app.include_router(billing_router)
