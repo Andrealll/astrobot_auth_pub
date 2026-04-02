@@ -99,13 +99,24 @@ def _env(key: str, default: str = "") -> str:
 
 
 PAYMENT_PACKS = {
+
+        "test": {
+            "id": "test",
+            "name": "Test",
+            "description": "Pack test 0.50€",
+            "credits": 10,
+            "price_eur": 0.5,
+            "stripe_price_id": _env("STRIPE_PRICE_TEST", "price_1T0MpD6LbfOjyQH3PTxK7o0p"),
+        },
+
+
     "small": {
         "id": "small",
         "name": "Provami!",
         "description": "Per iniziare a provare le letture premium.",
         "credits": 10,
         "price_eur": 9,
-        "stripe_price_id": _env("test", "price_1T0MpD6LbfOjyQH3PTxK7o0p"),
+        "stripe_price_id": _env("STRIPE_PRICE_SMALL", "price_1SdCJI6LbfOjyQH3ejI89wzQ"),
     },
     "medium": {
         "id": "medium",
