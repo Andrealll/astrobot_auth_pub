@@ -175,7 +175,12 @@ async def demo_premium_login():
         raise HTTPException(status_code=500, detail="DEMO_PREMIUM_USER_ID missing in env")
     return create_access_token_response(sub=DEMO_PREMIUM_USER_ID, role="premium")
 
+from auth.billing.payment_packs import PAYMENT_PACKS
 
+@app.get("/payments/packs")
+async def list_payment_packs():
+    return {"packs": list(PAYMENT_PACKS.values())}
+    
 from routes_credits_dashboard import router as dashboard_router
 app.include_router(dashboard_router)
 
