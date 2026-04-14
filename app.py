@@ -1,3 +1,5 @@
+from dotenv import load_dotenv
+load_dotenv()
 from fastapi import FastAPI, HTTPException, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
@@ -5,7 +7,7 @@ from cryptography.fernet import Fernet
 import jwt
 import os
 import httpx
-from dotenv import load_dotenv
+
 
 from auth.magiclink.routes_auth_magiclink import (
     router as auth_magiclink_router,
@@ -193,3 +195,4 @@ app.include_router(billing_router)
 @app.get("/hello", tags=["Health"])
 def hello():
     return {"hello": "world"}
+    
