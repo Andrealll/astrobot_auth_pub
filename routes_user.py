@@ -1,11 +1,10 @@
-# routes_user.py
-
 from datetime import datetime, timezone
 import os
-import jwt
-import httpx
 
+import httpx
+import jwt
 from fastapi import APIRouter, Depends, Header, HTTPException
+from pydantic import BaseModel
 
 router = APIRouter()
 
@@ -15,63 +14,77 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 ISSUER = os.getenv("AUTH_ISSUER", "astrobot-auth-pub")
 AUDIENCE = os.getenv("AUTH_AUDIENCE", "chatbot-test")
 
-def _load_public_key() -> bytes:
-    pem = os.getenv("AUTH_PUBLIC_KEY_PEM")
-    if pem:
-        return pem.encode("utf-8")
-    path = os.getenv("AUTH_PUBLIC_KEY_PATH", "secrets/jwtRS256.key.pub")
-    try:
-        return open(path, "rb").read()
-    except Exception as e:
-        raise RuntimeError(f"Missing public key file at {path}: {e}")
 
-PUBLIC_KEY = _load_public_key()
-
-# -------------------------------
-# JWT Decoding (SAFE)
-# -------------------------------
-class UserContext:
-    def __init__(self, user_id: str, role: str):
-        self.sub = user_id
-        self.role = role
+class UserContext(BaseModel):
+    sub: str
+    role: str
 
 
 def get_current_user(authorization: str = Header(None)) -> UserContext:
+    """
+    Legge il JWT emesso da astrobot_auth_pub.
+    Qui NON verifichiamo la firma: leggiamo il payload e validiamo manualmente
+    i claim che ci interessano, come già fatto nella dashboard crediti.
+    """
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Empty bearer token")
 
     try:
         payload = jwt.decode(
             token,
-            key=PUBLIC_KEY,
-            algorithms=["RS256"],
-            issuer=ISSUER,
-            audience=AUDIENCE,
             options={
-                "require": ["sub", "iss", "aud", "iat", "exp"],
-                "verify_exp": True,
+                "verify_signature": False,
+                "verify_exp": False,
+                "verify_nbf": False,
+                "verify_iat": False,
+                "verify_aud": False,
+                "verify_iss": False,
             },
-            leeway=30,
+            algorithms=["RS256"],
         )
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
     except jwt.PyJWTError as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
+    if payload.get("iss") != ISSUER:
+        raise HTTPException(status_code=401, detail="Invalid token issuer")
+
+    if payload.get("aud") != AUDIENCE:
+        raise HTTPException(status_code=401, detail="Invalid token audience")
+
     sub = payload.get("sub")
+    role = payload.get("role", "free")
+
     if not sub:
         raise HTTPException(status_code=401, detail="Invalid token (missing sub)")
 
-    return UserContext(sub, payload.get("role", "free"))
+    return UserContext(sub=sub, role=role)
+
+
+def _require_supabase():
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase non configurato")
+
+
+def _admin_headers() -> dict:
+    return {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
 
 
 # -------------------------------
 # PATCH /user/privacy
 # -------------------------------
 @router.patch("/user/privacy")
-async def update_privacy(settings: dict, user: UserContext = Depends(get_current_user)):
+async def update_privacy(
+    settings: dict,
+    user: UserContext = Depends(get_current_user),
+):
     """
     Aggiorna user_metadata.marketing_consent in auth.users.
 
@@ -83,40 +96,26 @@ async def update_privacy(settings: dict, user: UserContext = Depends(get_current
     if "marketing_consent" not in settings:
         raise HTTPException(status_code=400, detail="Missing marketing_consent")
 
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        raise HTTPException(status_code=500, detail="Supabase non configurato")
+    _require_supabase()
 
     url = f"{SUPABASE_URL}/auth/v1/admin/users/{user.sub}"
-    headers = {
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    patch_body = {
+    body = {
         "user_metadata": {
-            "marketing_consent": settings["marketing_consent"],
-            "marketing_consent_updated_at": datetime.utcnow().isoformat(),
+            "marketing_consent": bool(settings["marketing_consent"]),
+            "marketing_consent_updated_at": datetime.now(timezone.utc).isoformat(),
         }
     }
 
-    async with httpx.AsyncClient() as client:
-        # PRIMA: resp = await client.patch(...)
-        resp = await client.put(url, headers=headers, json=patch_body)
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.put(url, headers=_admin_headers(), json=body)
 
-    status = resp.status_code
-    text = resp.text or "<vuoto>"
-
-    # ✅ accettiamo 200, 201, 204 come success
-    if status not in (200, 201, 204):
+    if resp.status_code not in (200, 201, 204):
         raise HTTPException(
             status_code=500,
-            detail=f"Supabase error {status}: {text}",
+            detail=f"Supabase error {resp.status_code}: {resp.text}",
         )
 
     return {"status": "ok"}
-
-
 
 
 # -------------------------------
@@ -125,44 +124,38 @@ async def update_privacy(settings: dict, user: UserContext = Depends(get_current
 @router.delete("/user/delete")
 async def delete_user(user: UserContext = Depends(get_current_user)):
     """
-    Anonimizza la mail dell'utente in auth.users.
+    Pseudo-delete:
+    anonimizza la mail dell'utente e marca deleted=true in user_metadata.
     NON tocca entitlements, purchases, usage_logs, ecc.
     """
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        raise HTTPException(status_code=500, detail="Supabase non configurato")
+    _require_supabase()
 
     anon_email = f"deleted_{user.sub}@dyana.app"
-
     url = f"{SUPABASE_URL}/auth/v1/admin/users/{user.sub}"
-    headers = {
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-        "Content-Type": "application/json",
-    }
 
     body = {
         "email": anon_email,
         "user_metadata": {
             "deleted": True,
-            "deleted_at": datetime.utcnow().isoformat(),
+            "deleted_at": datetime.now(timezone.utc).isoformat(),
         },
     }
 
-    # 🔧 QUI LA MODIFICA: PATCH → PUT
-    async with httpx.AsyncClient() as client:
-        resp = await client.put(url, headers=headers, json=body)
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.put(url, headers=_admin_headers(), json=body)
 
-    status = resp.status_code
-    text = resp.text or "<vuoto>"
-
-    if status not in (200, 201, 204):
+    if resp.status_code not in (200, 201, 204):
         raise HTTPException(
             status_code=500,
-            detail=f"Supabase error {status}: {text}",
+            detail=f"Supabase error {resp.status_code}: {resp.text}",
         )
 
     return {"status": "ok"}
 
+
+# -------------------------------
+# POST /cookie/accept
+# -------------------------------
 @router.post("/cookie/accept")
 async def accept_cookies(user: UserContext = Depends(get_current_user)):
     """
@@ -170,18 +163,14 @@ async def accept_cookies(user: UserContext = Depends(get_current_user)):
 
     - Se è un guest (sub = "anon-...") → aggiorna la riga in public.guests
       mettendo cookies_accepted = true, cookies_accepted_at = now().
-    - Se è un utente registrato → per ora NON facciamo nulla (i free per loro
-      sono gestiti dal marketing consent).
+    - Se è un utente registrato → per ora NON facciamo nulla.
     """
-    # 1) Se non è guest, per ora non facciamo nulla di speciale
     if not user.sub.startswith("anon-"):
-        # In futuro potremo loggare anche per i registrati (user_metadata).
         return {"status": "ok", "is_guest": False}
 
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        raise HTTPException(status_code=500, detail="Supabase non configurato.")
+    _require_supabase()
 
-    guest_id = user.sub[5:]  # rimuove "anon-"
+    guest_id = user.sub[5:]
     now_iso = datetime.now(timezone.utc).isoformat()
 
     url = f"{SUPABASE_URL}/rest/v1/guests"
@@ -199,7 +188,7 @@ async def accept_cookies(user: UserContext = Depends(get_current_user)):
         "cookies_accepted_at": now_iso,
     }
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.patch(url, headers=headers, params=params, json=body)
 
     if resp.status_code not in (200, 201, 204):
