@@ -85,38 +85,52 @@ async def update_privacy(
     settings: dict,
     user: UserContext = Depends(get_current_user),
 ):
-    """
-    Aggiorna user_metadata.marketing_consent in auth.users.
-
-    Payload:
-    {
-      "marketing_consent": true/false
-    }
-    """
     if "marketing_consent" not in settings:
         raise HTTPException(status_code=400, detail="Missing marketing_consent")
 
     _require_supabase()
 
+    consent = bool(settings["marketing_consent"])
+    now_iso = datetime.now(timezone.utc).isoformat()
+
     url = f"{SUPABASE_URL}/auth/v1/admin/users/{user.sub}"
     body = {
         "user_metadata": {
-            "marketing_consent": bool(settings["marketing_consent"]),
-            "marketing_consent_updated_at": datetime.now(timezone.utc).isoformat(),
+            "marketing_consent": consent,
+            "marketing_consent_updated_at": now_iso,
         }
     }
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.put(url, headers=_admin_headers(), json=body)
 
-    if resp.status_code not in (200, 201, 204):
-        raise HTTPException(
-            status_code=500,
-            detail=f"Supabase error {resp.status_code}: {resp.text}",
+        if resp.status_code not in (200, 201, 204):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Supabase error {resp.status_code}: {resp.text}",
+            )
+
+        resp_profile = await client.post(
+            f"{SUPABASE_URL}/rest/v1/user_marketing_profile?on_conflict=user_id",
+            headers={
+                **_admin_headers(),
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            },
+            json={
+                "user_id": user.sub,
+                "marketing_consent": consent,
+                "marketing_consent_updated_at": now_iso,
+                "updated_at": now_iso,
+            },
         )
 
-    return {"status": "ok"}
+        if resp_profile.status_code not in (200, 201, 204):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Marketing profile error {resp_profile.status_code}: {resp_profile.text}",
+            )
 
+    return {"status": "ok"}
 
 # -------------------------------
 # DELETE /user/delete
