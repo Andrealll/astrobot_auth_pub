@@ -65,7 +65,7 @@ def _load_public_key() -> bytes:
 PUBLIC_KEY = _load_public_key()
 
 
-def create_access_token_response(sub: str, role: str) -> dict:
+def create_access_token_response(sub: str, role: str, email: str | None = None) -> dict:
     payload = {
         "sub": sub,
         "role": role,
@@ -74,6 +74,10 @@ def create_access_token_response(sub: str, role: str) -> dict:
         "iat": datetime.utcnow(),
         "exp": datetime.utcnow() + timedelta(hours=1),
     }
+
+    if email:
+        payload["email"] = email.strip().lower()
+
     token = jwt.encode(payload, PRIVATE_KEY, algorithm="RS256", headers={"kid": "k1"})
     return {"access_token": token, "token_type": "Bearer", "expires_in": 3600}
 
@@ -157,8 +161,7 @@ async def login(email: str = Form(...), password: str = Form(...)):
         plan = row.get("plan")
 
     role = "premium" if plan == "premium" else "free"
-    return create_access_token_response(sub=user_id, role=role)
-
+    return create_access_token_response(sub=user_id, role=role, email=email)
 
 DEMO_FREE_USER_ID = os.getenv("DEMO_FREE_USER_ID")
 DEMO_PREMIUM_USER_ID = os.getenv("DEMO_PREMIUM_USER_ID")
