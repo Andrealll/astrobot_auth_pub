@@ -179,6 +179,7 @@ class PurchaseItem(BaseModel):
 class UsageHistoryResponse(BaseModel):
     usage: List[UsageItem]
     purchases: List[PurchaseItem]
+    report_history: List[dict] = []
 
 
 # ===============================
@@ -373,6 +374,14 @@ async def get_usage_history(user: UserContext = Depends(get_current_user)):
         },
     )
 
+    report_rows = await supabase_get("/rest/v1/report_history", params={
+        "email": f"ilike.{user.email}",
+        "tier": "eq.premium",
+        "order": "created_at.desc",
+        "limit": 20,
+    })
+    
+
     # purchases: ultimi 20 acquisti
     purchase_rows = await supabase_get(
         "/rest/v1/purchases",
@@ -428,4 +437,8 @@ async def get_usage_history(user: UserContext = Depends(get_current_user)):
             )
         )
 
-    return UsageHistoryResponse(usage=usage_items, purchases=purchase_items)
+    return UsageHistoryResponse(
+        usage=usage_items,
+        purchases=purchase_items,
+        report_history=report_rows or [],
+    )
