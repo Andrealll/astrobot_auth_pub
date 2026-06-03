@@ -72,14 +72,14 @@ def create_access_token_response(sub: str, role: str, email: str | None = None) 
         "iss": ISSUER,
         "aud": AUDIENCE,
         "iat": datetime.utcnow(),
-        "exp": datetime.utcnow() + timedelta(hours=1),
+        "exp": datetime.utcnow() + timedelta(days=30),
     }
 
     if email:
         payload["email"] = email.strip().lower()
 
     token = jwt.encode(payload, PRIVATE_KEY, algorithm="RS256", headers={"kid": "k1"})
-    return {"access_token": token, "token_type": "Bearer", "expires_in": 3600}
+    return {"access_token": token, "token_type": "Bearer", "expires_in":  60 * 60 * 24 * 30}
 
 
 @app.get("/")
