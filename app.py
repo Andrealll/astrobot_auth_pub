@@ -1,5 +1,6 @@
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
+
 from fastapi import FastAPI, HTTPException, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
@@ -15,7 +16,6 @@ from auth.magiclink.routes_auth_magiclink import (
 )
 from auth.billing.routes_billing import router as billing_router
 
-load_dotenv()
 
 app = FastAPI(title="AstroBot Auth Pub", version="2.0")
 
