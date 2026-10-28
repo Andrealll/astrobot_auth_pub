@@ -1,4 +1,7 @@
 from datetime import datetime, timezone
+import hashlib
+import hmac
+import logging
 import os
 
 import httpx
@@ -7,9 +10,11 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+ATTRIBUTION_OWNER_HMAC_KEY = os.getenv("ATTRIBUTION_OWNER_HMAC_KEY")
 
 ISSUER = os.getenv("AUTH_ISSUER", "astrobot-auth-pub")
 AUDIENCE = os.getenv("AUTH_AUDIENCE", "chatbot-test")
@@ -20,11 +25,44 @@ class UserContext(BaseModel):
     role: str
 
 
+class CheckoutAttributionRevokeRequest(BaseModel):
+    attribution_context_id: str
+
+
+def _owner_subject_hash(subject: str) -> str:
+    if not ATTRIBUTION_OWNER_HMAC_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Attribution revocation temporarily unavailable",
+        )
+
+    return hmac.new(
+        ATTRIBUTION_OWNER_HMAC_KEY.encode("utf-8"),
+        subject.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _load_public_key() -> bytes:
+    """Carica la chiave pubblica RS256 condivisa dal servizio auth pubblico."""
+    pem = os.getenv("AUTH_PUBLIC_KEY_PEM")
+    if pem:
+        normalized = pem.replace("\\n", "\n").strip()
+        if "BEGIN PUBLIC KEY" not in normalized:
+            normalized = (
+                "-----BEGIN PUBLIC KEY-----\n"
+                + normalized
+                + "\n-----END PUBLIC KEY-----"
+            )
+        return normalized.encode("utf-8")
+
+    path = os.getenv("AUTH_PUBLIC_KEY_PATH", "secrets/jwtRS256.key.pub")
+    return open(path, "rb").read()
+
+
 def get_current_user(authorization: str = Header(None)) -> UserContext:
     """
-    Legge il JWT emesso da astrobot_auth_pub.
-    Qui NON verifichiamo la firma: leggiamo il payload e validiamo manualmente
-    i claim che ci interessano, come già fatto nella dashboard crediti.
+    Verifica il JWT emesso da astrobot_auth_pub.
     """
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -36,24 +74,20 @@ def get_current_user(authorization: str = Header(None)) -> UserContext:
     try:
         payload = jwt.decode(
             token,
-            options={
-                "verify_signature": False,
-                "verify_exp": False,
-                "verify_nbf": False,
-                "verify_iat": False,
-                "verify_aud": False,
-                "verify_iss": False,
-            },
+            key=_load_public_key(),
             algorithms=["RS256"],
+            issuer=ISSUER,
+            audience=AUDIENCE,
+            options={
+                "require": ["sub", "iss", "aud", "iat", "exp"],
+                "verify_exp": True,
+                "verify_iat": True,
+                "verify_nbf": True,
+            },
+            leeway=30,
         )
     except jwt.PyJWTError as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
-
-    if payload.get("iss") != ISSUER:
-        raise HTTPException(status_code=401, detail="Invalid token issuer")
-
-    if payload.get("aud") != AUDIENCE:
-        raise HTTPException(status_code=401, detail="Invalid token audience")
 
     sub = payload.get("sub")
     role = payload.get("role", "free")
@@ -129,6 +163,72 @@ async def update_privacy(
                 status_code=500,
                 detail=f"Marketing profile error {resp_profile.status_code}: {resp_profile.text}",
             )
+
+    return {"status": "ok"}
+
+
+# -------------------------------
+# POST /privacy/checkout-attribution/revoke
+# -------------------------------
+@router.post("/privacy/checkout-attribution/revoke")
+async def revoke_checkout_attribution(
+    body: CheckoutAttributionRevokeRequest,
+    user: UserContext = Depends(get_current_user),
+):
+    context_id = (body.attribution_context_id or "").strip()
+    if not context_id or len(context_id) > 128:
+        raise HTTPException(status_code=400, detail="Invalid request")
+
+    _require_supabase()
+    owner_hash = _owner_subject_hash(user.sub)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    update_payload = {
+        "gclid": None,
+        "gbraid": None,
+        "wbraid": None,
+        "utm_source": None,
+        "utm_medium": None,
+        "utm_campaign": None,
+        "utm_content": None,
+        "utm_term": None,
+        "ga4_client_id": None,
+        "ga4_session_id": None,
+        "revoked_at": now_iso,
+        "revocation_source": "client_consent_revocation",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.patch(
+                f"{SUPABASE_URL}/rest/v1/checkout_attribution",
+                headers={
+                    **_admin_headers(),
+                    "Prefer": "return=minimal",
+                },
+                params={
+                    "attribution_context_id": f"eq.{context_id}",
+                    "owner_subject_hash": f"eq.{owner_hash}",
+                    "revoked_at": "is.null",
+                },
+                json=update_payload,
+            )
+    except httpx.HTTPError:
+        logger.error("[PRIVACY] checkout attribution revocation unavailable")
+        raise HTTPException(
+            status_code=503,
+            detail="Attribution revocation temporarily unavailable",
+        )
+
+    if response.status_code not in (200, 204):
+        logger.error(
+            "[PRIVACY] checkout attribution revocation persistence failed status=%s",
+            response.status_code,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Attribution revocation temporarily unavailable",
+        )
 
     return {"status": "ok"}
 

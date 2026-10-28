@@ -194,6 +194,12 @@ app.include_router(user_router)
 
 app.include_router(billing_router)
 
+from routes_tema_ai_v2_billing import router as tema_ai_v2_billing_router
+app.include_router(tema_ai_v2_billing_router)
+
+from routes_analytics_delivery import router as analytics_delivery_router
+app.include_router(analytics_delivery_router)
+
 
 @app.get("/hello", tags=["Health"])
 def hello():

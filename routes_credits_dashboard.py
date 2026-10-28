@@ -44,23 +44,21 @@ ISSUER = os.getenv("AUTH_ISSUER", "astrobot-auth-pub")
 AUDIENCE = os.getenv("AUTH_AUDIENCE", "chatbot-test")
 
 
-def load_private_key_for_dashboard():
-    """
-    Copia minimale della logica in app.py per poter verificare il JWT
-    senza importare app (evitiamo import circolari).
-    """
-    path = os.getenv("AUTH_PRIVATE_KEY_ENC_PATH", "secrets/jwtRS256.key.enc")
-    key_env = os.getenv("AUTH_ENC_KEY")
-    if not key_env:
-        raise RuntimeError("❌ Mancante AUTH_ENC_KEY nelle variabili d'ambiente.")
-    from cryptography.fernet import Fernet
+def _load_dashboard_public_key() -> bytes:
+    """Carica la stessa chiave pubblica RS256 usata dalle route Tema V2."""
+    pem = os.getenv("AUTH_PUBLIC_KEY_PEM")
+    if pem:
+        normalized = pem.replace("\\n", "\n").strip()
+        if "BEGIN PUBLIC KEY" not in normalized:
+            normalized = (
+                "-----BEGIN PUBLIC KEY-----\n"
+                + normalized
+                + "\n-----END PUBLIC KEY-----"
+            )
+        return normalized.encode("utf-8")
 
-    fernet = Fernet(key_env.encode())
-    enc_data = open(path, "rb").read()
-    return fernet.decrypt(enc_data)
-
-
-PRIVATE_KEY = load_private_key_for_dashboard()
+    path = os.getenv("AUTH_PUBLIC_KEY_PATH", "secrets/jwtRS256.key.pub")
+    return open(path, "rb").read()
 
 router = APIRouter()
 
@@ -97,8 +95,7 @@ class UserContext(BaseModel):
 
 def get_current_user(authorization: str = Header(None)) -> UserContext:
     """
-    Decodifica il JWT emesso da astrobot_auth_pub e ritorna user_id + role (+ email se presente).
-    Qui NON verifichiamo la firma, ma controlliamo iss e aud.
+    Verifica il JWT emesso da astrobot_auth_pub e ritorna user_id + role (+ email se presente).
     """
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -108,14 +105,20 @@ def get_current_user(authorization: str = Header(None)) -> UserContext:
     try:
         payload = jwt.decode(
             token,
-            options={"verify_signature": False},
+            key=_load_dashboard_public_key(),
             algorithms=["RS256"],
+            issuer=ISSUER,
+            audience=AUDIENCE,
+            options={
+                "require": ["sub", "iss", "aud", "iat", "exp"],
+                "verify_exp": True,
+                "verify_iat": True,
+                "verify_nbf": True,
+            },
+            leeway=30,
         )
     except jwt.PyJWTError as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
-
-    if payload.get("iss") != ISSUER or payload.get("aud") != AUDIENCE:
-        raise HTTPException(status_code=401, detail="Invalid token issuer/audience")
 
     sub = payload.get("sub")
     role = payload.get("role", "free")
@@ -377,9 +380,21 @@ async def get_usage_history(user: UserContext = Depends(get_current_user)):
     report_rows = await supabase_get("/rest/v1/report_history", params={
         "email": f"ilike.{user.email}",
         "tier": "eq.premium",
+        "or": f"(feature.neq.tema_ai_v2,feature.is.null,user_id.eq.{user.user_id})",
         "order": "created_at.desc",
         "limit": 20,
     })
+    report_rows = [
+        row for row in (report_rows or [])
+        if not (
+            isinstance(row, dict)
+            and row.get("feature") == "tema_ai_v2"
+            and (
+                row.get("user_id") != user.user_id
+                or row.get("tier") != "premium"
+            )
+        )
+    ]
     
 
     # purchases: ultimi 20 acquisti
