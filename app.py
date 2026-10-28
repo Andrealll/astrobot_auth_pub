@@ -22,6 +22,8 @@ app = FastAPI(title="AstroBot Auth Pub", version="2.0")
 ALLOWED_ORIGINS = [
     "https://dyana.app",
     "https://www.dyana.app",
+    "https://dyanalux.com",
+    "https://www.dyanalux.com",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://172.20.10.2:3000",
