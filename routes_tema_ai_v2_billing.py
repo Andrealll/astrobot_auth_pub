@@ -43,6 +43,7 @@ class TemaAiV2ReportRequest(BaseModel):
 class TemaAiV2UserContext(BaseModel):
     sub: str
     role: str = "free"
+    email: str | None = None
 
 
 def _load_v2_public_key() -> bytes:
@@ -91,7 +92,12 @@ def get_current_tema_ai_v2_user(
     sub = payload.get("sub")
     if not sub:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token without sub")
-    return TemaAiV2UserContext(sub=sub, role=payload.get("role", "free") or "free")
+    email = payload.get("email")
+    return TemaAiV2UserContext(
+        sub=sub,
+        role=payload.get("role", "free") or "free",
+        email=email.strip().lower() if isinstance(email, str) and email.strip() else None,
+    )
 
 
 def _is_guest(user: TemaAiV2UserContext) -> bool:
@@ -114,7 +120,9 @@ def _get_owned_report(report_id: str, user: TemaAiV2UserContext) -> dict[str, An
         ):
             raise HTTPException(status_code=403, detail="Report non autorizzato.")
     elif report.get("user_id") != user.sub:
-        raise HTTPException(status_code=403, detail="Report non autorizzato.")
+        report_email = str(report.get("email") or "").strip().lower()
+        if report.get("user_id") is not None or not user.email or report_email != user.email:
+            raise HTTPException(status_code=403, detail="Report non autorizzato.")
     return report
 
 
@@ -143,6 +151,28 @@ def _tema_vis_for_response(report: dict[str, Any]) -> dict[str, Any] | None:
     return response
 
 
+def _locked_report_for_recovery(full_report: dict[str, Any]) -> dict[str, Any]:
+    """Proiezione deterministica del report Premium gia' persistito, senza AI."""
+    sections = full_report.get("sezioni")
+    if not isinstance(sections, list):
+        raise HTTPException(status_code=500, detail="Report V2 salvato non valido.")
+    return {
+        "titolo": full_report.get("titolo"),
+        "sezioni": [
+            {"titolo": section.get("titolo"), "apertura": section.get("apertura")}
+            for section in sections
+            if isinstance(section, dict)
+        ],
+    }
+
+
+def _tema_vis_preview_for_response(report: dict[str, Any]) -> dict[str, Any] | None:
+    tema_vis = _tema_vis_for_response(report)
+    if not isinstance(tema_vis, dict):
+        return tema_vis
+    return {key: value for key, value in tema_vis.items() if key not in {"pianeti", "aspetti"}}
+
+
 def _send_tema_ai_v2_logged_unlock_notifications(report: dict[str, Any], full_report: dict[str, Any]) -> None:
     """Best-effort: uno sblocco con crediti non viene presentato come un pagamento Stripe."""
     email = str(report.get("email") or "").strip().lower()
@@ -158,6 +188,31 @@ def _send_tema_ai_v2_logged_unlock_notifications(report: dict[str, Any], full_re
         _send_tema_ai_v2_premium_report_email(email, lang, full_report)
     except Exception:
         logger.exception("[TEMA_AI_V2] email Premium fallita report_id=%r", report.get("id"))
+
+
+@router.get("/tema-ai-v2/reports/{report_id}")
+def recover_tema_ai_v2_report(
+    report_id: str,
+    user: TemaAiV2UserContext = Depends(get_current_tema_ai_v2_user),
+):
+    """Recupera esclusivamente il report V2 salvato e solo per il suo proprietario verificato."""
+    report = _get_owned_report(report_id, user)
+    full_report = _full_report_or_error(report)
+    if report.get("tier") == "premium":
+        return {
+            "report_id": report["id"],
+            "tier": "premium",
+            "full_report": full_report,
+            "tema_vis": _tema_vis_for_response(report),
+        }
+    if report.get("tier") != "free":
+        raise HTTPException(status_code=409, detail="Tier report non valido.")
+    return {
+        "report_id": report["id"],
+        "tier": "free",
+        "locked_report": _locked_report_for_recovery(full_report),
+        "tema_vis_preview": _tema_vis_preview_for_response(report),
+    }
 
 
 @router.post("/guest-orders/tema-ai-v2/checkout")
